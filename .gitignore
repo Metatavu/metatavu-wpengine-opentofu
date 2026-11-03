@@ -1,0 +1,3 @@
+dist/
+/terraform-provider-wpengine*
+.DS_Store
