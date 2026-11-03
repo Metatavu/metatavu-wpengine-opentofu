@@ -1,0 +1,13 @@
+name: Install the wpengine OpenTofu provider
+description: >
+  Installs a release of the wpengine provider into OpenTofu's implicit local
+  filesystem mirror, so `tofu init` finds metatavu.io/metatavu/wpengine.
+inputs:
+  version:
+    description: The release, for example 0.1.0
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: '"$GITHUB_ACTION_PATH/../../../scripts/install.sh" "${{ inputs.version }}"'
