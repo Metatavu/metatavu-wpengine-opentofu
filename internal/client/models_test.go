@@ -12,8 +12,12 @@ import (
 // it sends is in its operation's request body.
 func TestModelsMatchTheOpenAPIDocument(t *testing.T) {
 	responses := map[string]any{
-		"Site":         Site{},
-		"Installation": Install{},
+		"Site":           Site{},
+		"Installation":   Install{},
+		"Domain":         Domain{},
+		"CacheExclusion": CacheExclusion{},
+		"AccountUser":    AccountUser{},
+		"SshKey":         SSHKey{},
 	}
 	for schema, model := range responses {
 		for _, field := range jsonFields(reflect.TypeOf(model), "") {
@@ -23,10 +27,16 @@ func TestModelsMatchTheOpenAPIDocument(t *testing.T) {
 		}
 	}
 	requests := map[string]any{
-		"createSite":    SiteCreate{},
-		"updateSite":    SiteUpdate{},
-		"createInstall": InstallCreate{},
-		"updateInstall": InstallUpdate{},
+		"createSite":            SiteCreate{},
+		"updateSite":            SiteUpdate{},
+		"createInstall":         InstallCreate{},
+		"updateInstall":         InstallUpdate{},
+		"createDomain":          DomainCreate{},
+		"updateDomain":          DomainUpdate{},
+		"updateCacheExclusions": CacheExclusionsUpdate{},
+		"createAccountUser":     AccountUserCreate{},
+		"updateAccountUser":     AccountUserUpdate{},
+		"createSshKey":          SSHKeyCreate{},
 	}
 	for operation, model := range requests {
 		for _, field := range jsonFields(reflect.TypeOf(model), "") {

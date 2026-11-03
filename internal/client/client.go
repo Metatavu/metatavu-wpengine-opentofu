@@ -112,6 +112,91 @@ func (c *Client) DeleteInstall(ctx context.Context, id string) error {
 	return c.do(ctx, http.MethodDelete, "/installs/"+url.PathEscape(id), nil, nil)
 }
 
+// ListDomains reads an install's domains.
+func (c *Client) ListDomains(ctx context.Context, installID string) ([]Domain, error) {
+	return list[Domain](ctx, c, "/installs/"+url.PathEscape(installID)+"/domains")
+}
+
+// GetDomain reads a domain of an install.
+func (c *Client) GetDomain(ctx context.Context, installID, id string) (*Domain, error) {
+	var domain Domain
+	return &domain, c.do(ctx, http.MethodGet, "/installs/"+url.PathEscape(installID)+"/domains/"+url.PathEscape(id), nil, &domain)
+}
+
+// CreateDomain adds a domain or a redirect to an install.
+func (c *Client) CreateDomain(ctx context.Context, installID string, request DomainCreate) (*Domain, error) {
+	var domain Domain
+	return &domain, c.do(ctx, http.MethodPost, "/installs/"+url.PathEscape(installID)+"/domains", request, &domain)
+}
+
+// UpdateDomain changes a domain of an install.
+func (c *Client) UpdateDomain(ctx context.Context, installID, id string, request DomainUpdate) (*Domain, error) {
+	var domain Domain
+	return &domain, c.do(ctx, http.MethodPatch, "/installs/"+url.PathEscape(installID)+"/domains/"+url.PathEscape(id), request, &domain)
+}
+
+// DeleteDomain removes a domain from an install.
+func (c *Client) DeleteDomain(ctx context.Context, installID, id string) error {
+	return c.do(ctx, http.MethodDelete, "/installs/"+url.PathEscape(installID)+"/domains/"+url.PathEscape(id), nil, nil)
+}
+
+// ListCacheExclusions reads an install's cache exclusions, WP Engine's own
+// cookie exclusions included.
+func (c *Client) ListCacheExclusions(ctx context.Context, installID string) ([]CacheExclusion, error) {
+	return list[CacheExclusion](ctx, c, "/installs/"+url.PathEscape(installID)+"/cache_exclusions")
+}
+
+// SetCacheExclusions replaces an install's writable cache exclusions.
+func (c *Client) SetCacheExclusions(ctx context.Context, installID string, exclusions []CacheExclusion) error {
+	return c.do(ctx, http.MethodPut, "/installs/"+url.PathEscape(installID)+"/cache_exclusions", CacheExclusionsUpdate{Exclusions: exclusions}, nil)
+}
+
+// GetAccountUser reads a user of an account.
+func (c *Client) GetAccountUser(ctx context.Context, accountID, userID string) (*AccountUser, error) {
+	var user AccountUser
+	return &user, c.do(ctx, http.MethodGet, "/accounts/"+url.PathEscape(accountID)+"/account_users/"+url.PathEscape(userID), nil, &user)
+}
+
+// ListAccountUsers reads an account's users.
+func (c *Client) ListAccountUsers(ctx context.Context, accountID string) ([]AccountUser, error) {
+	var p page[AccountUser]
+	return p.Results, c.do(ctx, http.MethodGet, "/accounts/"+url.PathEscape(accountID)+"/account_users", nil, &p)
+}
+
+// CreateAccountUser adds a user to an account. WP Engine emails them an
+// invitation.
+func (c *Client) CreateAccountUser(ctx context.Context, accountID string, request AccountUserCreate) (*AccountUser, error) {
+	var response accountUserResponse
+	return &response.AccountUser, c.do(ctx, http.MethodPost, "/accounts/"+url.PathEscape(accountID)+"/account_users", request, &response)
+}
+
+// UpdateAccountUser changes a user's roles and installs.
+func (c *Client) UpdateAccountUser(ctx context.Context, accountID, userID string, request AccountUserUpdate) (*AccountUser, error) {
+	var response accountUserResponse
+	return &response.AccountUser, c.do(ctx, http.MethodPatch, "/accounts/"+url.PathEscape(accountID)+"/account_users/"+url.PathEscape(userID), request, &response)
+}
+
+// DeleteAccountUser removes a user from an account.
+func (c *Client) DeleteAccountUser(ctx context.Context, accountID, userID string) error {
+	return c.do(ctx, http.MethodDelete, "/accounts/"+url.PathEscape(accountID)+"/account_users/"+url.PathEscape(userID), nil, nil)
+}
+
+// ListSSHKeys reads the API user's SSH keys.
+func (c *Client) ListSSHKeys(ctx context.Context) ([]SSHKey, error) {
+	return list[SSHKey](ctx, c, "/ssh_keys")
+}
+
+// CreateSSHKey adds an SSH key to the API user.
+func (c *Client) CreateSSHKey(ctx context.Context, publicKey string) (*SSHKey, error) {
+	var key SSHKey
+	return &key, c.do(ctx, http.MethodPost, "/ssh_keys", SSHKeyCreate{PublicKey: publicKey}, &key)
+}
+
+// DeleteSSHKey removes one of the API user's SSH keys.
+func (c *Client) DeleteSSHKey(ctx context.Context, uuid string) error {
+	return c.do(ctx, http.MethodDelete, "/ssh_keys/"+url.PathEscape(uuid), nil, nil)
+}
+
 // list follows a list operation's pages.
 func list[T any](ctx context.Context, c *Client, path string) ([]T, error) {
 	var all []T

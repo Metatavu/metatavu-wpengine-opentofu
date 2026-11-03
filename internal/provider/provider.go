@@ -96,6 +96,10 @@ func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewSiteResource,
 		NewInstallResource,
+		NewDomainResource,
+		NewCacheExclusionsResource,
+		NewAccountUserResource,
+		NewSSHKeyResource,
 	}
 }
 
