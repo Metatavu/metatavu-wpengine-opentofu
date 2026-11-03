@@ -40,6 +40,11 @@ type Server struct {
 	pending  map[string]int
 	next     int
 
+	domains    map[string]map[string]*client.Domain
+	exclusions map[string][]client.CacheExclusion
+	users      map[string]map[string]*client.AccountUser
+	sshKeys    map[string]*client.SSHKey
+
 	// PendingReads is how many reads a new install stays pending for.
 	PendingReads int
 	// Calls counts requests by operation ID.
@@ -54,6 +59,11 @@ func New() *Server {
 		installs: map[string]*client.Install{},
 		pending:  map[string]int{},
 		Calls:    map[string]int{},
+
+		domains:    map[string]map[string]*client.Domain{},
+		exclusions: map[string][]client.CacheExclusion{},
+		users:      map[string]map[string]*client.AccountUser{},
+		sshKeys:    map[string]*client.SSHKey{},
 	}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.handle))
 	return s
@@ -65,6 +75,7 @@ func (s *Server) AddAccount() string {
 	defer s.mu.Unlock()
 	id := s.id()
 	s.accounts[id] = true
+	s.users[id] = map[string]*client.AccountUser{}
 	return id
 }
 
@@ -181,6 +192,14 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.createInstall(w, r)
 	case len(parts) == 2 && parts[0] == "installs":
 		s.install(w, r, parts[1])
+	case len(parts) >= 3 && parts[0] == "installs" && parts[2] == "domains":
+		s.domain(w, r, parts[1], parts[3:])
+	case len(parts) == 3 && parts[0] == "installs" && parts[2] == "cache_exclusions":
+		s.cacheExclusions(w, r, parts[1])
+	case len(parts) >= 3 && parts[0] == "accounts" && parts[2] == "account_users":
+		s.accountUser(w, r, parts[1], parts[3:])
+	case len(parts) >= 1 && parts[0] == "ssh_keys":
+		s.sshKey(w, r, parts[1:])
 	default:
 		writeError(w, http.StatusNotFound, "Not Found")
 	}
@@ -359,8 +378,15 @@ func flatten(value map[string]any, prefix string) []string {
 	var out []string
 	for key, v := range value {
 		out = append(out, prefix+key)
-		if nested, ok := v.(map[string]any); ok {
+		switch nested := v.(type) {
+		case map[string]any:
 			out = append(out, flatten(nested, prefix+key+".")...)
+		case []any:
+			for _, item := range nested {
+				if object, ok := item.(map[string]any); ok {
+					out = append(out, flatten(object, prefix+key+".")...)
+				}
+			}
 		}
 	}
 	return out

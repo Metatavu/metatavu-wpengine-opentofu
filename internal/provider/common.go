@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 
 	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -63,4 +65,46 @@ func stringPointer(value types.String) *string {
 func stringList(values []string) types.List {
 	list, _ := types.ListValueFrom(context.Background(), types.StringType, append([]string{}, values...))
 	return list
+}
+
+// resolveInstall turns an install's ID or name into its ID.
+func resolveInstall(ctx context.Context, c *client.Client, ref string) (string, error) {
+	if uuidPattern.MatchString(ref) {
+		return ref, nil
+	}
+	installs, err := c.ListInstalls(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, install := range installs {
+		if install.Name == ref {
+			return install.ID, nil
+		}
+	}
+	return "", fmt.Errorf("the API user sees no install named %s", ref)
+}
+
+// splitImportID splits "<first>/<rest>".
+func splitImportID(id, format string, diags *diag.Diagnostics) (string, string, bool) {
+	first, rest, ok := strings.Cut(id, "/")
+	if !ok || first == "" || rest == "" {
+		diags.AddError("Invalid import ID", "Import with "+format+", not "+id+".")
+		return "", "", false
+	}
+	return first, rest, true
+}
+
+func stringSet(values []string) types.Set {
+	set, _ := types.SetValueFrom(context.Background(), types.StringType, append([]string{}, values...))
+	return set
+}
+
+func setStrings(ctx context.Context, value types.Set, diags *diag.Diagnostics) []string {
+	out := []string{}
+	if value.IsNull() || value.IsUnknown() {
+		return out
+	}
+	diags.Append(value.ElementsAs(ctx, &out, false)...)
+	sort.Strings(out)
+	return out
 }
