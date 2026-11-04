@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -207,5 +208,75 @@ func TestReadTokensAreReusedAndWritesGetFreshOnes(t *testing.T) {
 	}
 	if fmt.Sprint(seen) != fmt.Sprint(want) {
 		t.Fatalf("got %q\nwant %q", seen, want)
+	}
+}
+
+// WordPress's maintenance answers while an update is installed: wp_die's HTML
+// page, or its JSON to a request that accepts JSON, as the client's do.
+const (
+	maintenancePage = `<!DOCTYPE html><html><body><h1>Briefly unavailable for scheduled maintenance. Check back in a minute.</h1></body></html>`
+	maintenanceJSON = `{"code":"wp_die","message":"Briefly unavailable for scheduled maintenance. Check back in a minute.","data":{"status":503},"additional_errors":[]}`
+)
+
+func shortMaintenanceWait(t *testing.T, timeout time.Duration) {
+	saved := maintenanceWait
+	maintenanceWait.interval, maintenanceWait.timeout = time.Millisecond, timeout
+	t.Cleanup(func() { maintenanceWait = saved })
+}
+
+func TestAWriteWaitsOutMaintenanceModeWithAFreshTokenEachTime(t *testing.T) {
+	shortMaintenanceWait(t, time.Second)
+	var requests atomic.Int32
+	var bodies sync.Map
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := requests.Add(1)
+		raw, _ := io.ReadAll(r.Body)
+		bodies.Store(n, string(raw))
+		if n <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, map[int32]string{1: maintenanceJSON, 2: maintenancePage}[n])
+			return
+		}
+		fmt.Fprint(w, `{"exists": true, "sensitive": false, "value": "1"}`)
+	}))
+	defer plugin.Close()
+	tokens := &countingTokens{}
+	option, err := New(map[string]string{"acmedev": plugin.URL}, tokens, nil).PutOption(context.Background(), "acmedev", "a", "1")
+	if err != nil || !option.Exists {
+		t.Fatalf("option %+v, err %v", option, err)
+	}
+	if requests.Load() != 3 || tokens.n != 3 {
+		t.Fatalf("%d requests with %d tokens, want 3 and 3", requests.Load(), tokens.n)
+	}
+	if last, _ := bodies.Load(int32(3)); last != `{"value":"1"}` {
+		t.Fatalf("the retried body was %q", last)
+	}
+}
+
+func TestThePluginsOwn503IsNotRetried(t *testing.T) {
+	shortMaintenanceWait(t, time.Second)
+	var requests atomic.Int32
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"code": "metatavu_iac_disabled", "message": "The IaC API is switched off on this site."}`)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).State(context.Background(), "acmedev")
+	if !IsCode(err, "metatavu_iac_disabled") || requests.Load() != 1 {
+		t.Fatalf("err %v after %d requests", err, requests.Load())
+	}
+}
+
+func TestMaintenanceModeThatLastsFailsTheRequest(t *testing.T) {
+	shortMaintenanceWait(t, 20*time.Millisecond)
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, maintenancePage)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).State(context.Background(), "acmedev")
+	if err == nil || !strings.Contains(err.Error(), "maintenance mode for longer than") {
+		t.Fatalf("err %v", err)
 	}
 }

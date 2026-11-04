@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	fakewp "github.com/Metatavu/metatavu-wpengine-opentofu/internal/fake/wordpress"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -30,11 +31,34 @@ func releases(t *testing.T, names ...string) (*httptest.Server, map[string]strin
 	return server, sums
 }
 
+// shortReleaseWait makes an update's apply poll the fake WP-Cron quickly.
+func shortReleaseWait(t *testing.T, timeout time.Duration) {
+	saved := releaseWait
+	releaseWait.interval, releaseWait.timeout = 10*time.Millisecond, timeout
+	t.Cleanup(func() { releaseWait = saved })
+}
+
+func acmeRelease(server *fakewp.Server, zips string, sums map[string]string, version string) string {
+	return wordpressProvider(server, "acmedev") + fmt.Sprintf(`
+resource "wpengine_wordpress_plugin" "acme" {
+  install = "acmedev"
+  slug    = "acme-release"
+  source  = "release"
+  url     = "%s/acme-%s.zip"
+  version = %q
+  sha256  = %q
+}
+`, zips, version, version, sums["acme-"+version])
+}
+
 func TestWordPressPlugins(t *testing.T) {
 	server := newWordPress(t)
 	server.Whitelist("acmedev", "plugins", "classic-editor", "acme-release")
-	server.WordPressOrg["classic-editor"] = "1.7.0"
+	// Installed by the project's bootstrap/, inactive (plugin D18).
+	server.Install("acmedev", "plugins", "classic-editor", "1.7.0")
+	server.Install("acmedev", "plugins", "acme-release", "0.9.0")
 	zips, sums := releases(t, "acme-1.0.0", "acme-1.1.0")
+	shortReleaseWait(t, 5*time.Second)
 
 	plugins := func(active bool, version string) string {
 		return wordpressProvider(server, "acmedev") + fmt.Sprintf(`
@@ -61,15 +85,21 @@ resource "wpengine_wordpress_plugin" "acme" {
 		ProtoV6ProviderFactories: factories,
 		Steps: []resource.TestStep{
 			{
+				// Taken over: the release's update is installed by WP-Cron within the apply.
 				Config: plugins(true, "1.0.0"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.classic_editor", "installed_version", "1.7.0"),
 					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.acme", "installed_version", "1.0.0"),
 					func(*terraform.State) error {
-						if p := server.Package("acmedev", "plugins", "acme-release"); !p.Installed || !p.Active || p.Version != "1.0.0" {
+						if p := server.Package("acmedev", "plugins", "classic-editor"); !p.Active {
+							return fmt.Errorf("classic-editor %+v", p)
+						}
+						if p := server.Package("acmedev", "plugins", "acme-release"); !p.Active || p.Version != "1.0.0" || p.Pending != "" {
 							return fmt.Errorf("acme-release %+v", p)
 						}
-						uploads = server.Uploads["acmedev"]
+						if server.CronRuns["acmedev"] == 0 {
+							return fmt.Errorf("WP-Cron wasn't run")
+						}
 						return nil
 					},
 				),
@@ -93,7 +123,7 @@ resource "wpengine_wordpress_plugin" "acme" {
 				},
 			},
 			{
-				// Updated in wp-admin: the plan shows it, and the apply puts the declared release back.
+				// Changed in wp-admin: the plan shows it, and the apply puts the declared release back.
 				PreConfig: func() {
 					server.SetPackage("acmedev", "plugins", "acme-release", fakewp.Package{Installed: true, Version: "0.9.0", Active: true})
 				},
@@ -147,10 +177,11 @@ import {
 				},
 			},
 		},
+		// Destroying deactivates and leaves the plugins installed: bootstrap/ removes them (provider D20).
 		CheckDestroy: func(*terraform.State) error {
 			for _, slug := range []string{"classic-editor", "acme-release"} {
-				if server.Package("acmedev", "plugins", slug).Installed {
-					return fmt.Errorf("%s not deleted", slug)
+				if p := server.Package("acmedev", "plugins", slug); !p.Installed || p.Active {
+					return fmt.Errorf("%s %+v", slug, p)
 				}
 			}
 			return nil
@@ -158,25 +189,80 @@ import {
 	})
 }
 
-func TestAReleaseWithTheWrongChecksumIsNotUploaded(t *testing.T) {
+func TestAPackageMustBeInstalledByBootstrapFirst(t *testing.T) {
 	server := newWordPress(t)
-	server.Whitelist("acmedev", "plugins", "acme-release")
-	zips, sums := releases(t, "acme-1.0.0", "other")
+	server.Whitelist("acmedev", "plugins", "classic-editor")
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: factories,
 		Steps: []resource.TestStep{
 			{
-				Config: wordpressProvider(server, "acmedev") + fmt.Sprintf(`
-resource "wpengine_wordpress_plugin" "acme" {
+				Config: wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_plugin" "classic_editor" {
   install = "acmedev"
-  slug    = "acme-release"
-  source  = "release"
-  url     = "%s/acme-1.0.0.zip"
-  version = "1.0.0"
-  sha256  = %q
+  slug    = "classic-editor"
+  source  = "wordpress.org"
 }
-`, zips.URL, sums["other"]),
+`,
+				ExpectError: regexp.MustCompile(`(?s)install\s+it\s+with\s+the\s+project's\s+bootstrap/\s+first`),
+			},
+		},
+	})
+}
+
+func TestAFailedUpdateFailsTheApply(t *testing.T) {
+	server := newWordPress(t)
+	server.Whitelist("acmedev", "plugins", "acme-release")
+	server.Install("acmedev", "plugins", "acme-release", "1.0.0")
+	server.FailUpdates["acme-release"] = "Could not copy file."
+	zips, sums := releases(t, "acme-1.1.0")
+	shortReleaseWait(t, 5*time.Second)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config:      acmeRelease(server, zips.URL, sums, "1.1.0"),
+				ExpectError: regexp.MustCompile(`(?s)automatic\s+updater\s+failed:\s+Could\s+not\s+copy\s+file\.`),
+			},
+		},
+	})
+	if p := server.Package("acmedev", "plugins", "acme-release"); p.Version != "1.0.0" || p.Pending != "1.1.0" {
+		t.Fatalf("acme-release %+v", p)
+	}
+}
+
+func TestAnUpdateWordPressDoesNotInstallTimesOut(t *testing.T) {
+	server := newWordPress(t)
+	server.Whitelist("acmedev", "plugins", "acme-release")
+	server.Install("acmedev", "plugins", "acme-release", "1.0.0")
+	server.HoldUpdates = true
+	zips, sums := releases(t, "acme-1.1.0")
+	shortReleaseWait(t, 100*time.Millisecond)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config:      acmeRelease(server, zips.URL, sums, "1.1.0"),
+				ExpectError: regexp.MustCompile(`(?s)still\s+pending\s+after`),
+			},
+		},
+	})
+}
+
+func TestAReleaseWithTheWrongChecksumIsNotUploaded(t *testing.T) {
+	server := newWordPress(t)
+	server.Whitelist("acmedev", "plugins", "acme-release")
+	server.Install("acmedev", "plugins", "acme-release", "0.9.0")
+	zips, sums := releases(t, "acme-1.0.0", "other")
+	sums["acme-1.0.0"] = sums["other"]
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config:      acmeRelease(server, zips.URL, sums, "1.0.0"),
 				ExpectError: regexp.MustCompile(`(?s)not\s+the\s+declared`),
 			},
 		},
@@ -189,7 +275,7 @@ resource "wpengine_wordpress_plugin" "acme" {
 func TestWordPressThemes(t *testing.T) {
 	server := newWordPress(t)
 	server.Whitelist("acmedev", "themes", "twentytwentythree")
-	server.WordPressOrg["twentytwentythree"] = "1.7"
+	server.Install("acmedev", "themes", "twentytwentythree", "1.7")
 	theme := func(active string) string {
 		return wordpressProvider(server, "acmedev") + fmt.Sprintf(`
 resource "wpengine_wordpress_theme" "tt3" {
@@ -214,23 +300,22 @@ resource "wpengine_wordpress_active_theme" "acmedev" {
 				Config: theme("twentytwentythree"),
 				Check:  resource.TestCheckResourceAttr("wpengine_wordpress_theme.tt3", "installed_version", "1.7"),
 			},
+			{Config: theme("twentytwentyfive")},
 			{
-				// The active theme can't be deleted.
+				// Removed from code while installed: it's left installed for bootstrap/ to remove.
 				Config: wordpressProvider(server, "acmedev") + `
 resource "wpengine_wordpress_active_theme" "acmedev" {
   install = "acmedev"
-  slug    = "twentytwentythree"
+  slug    = "twentytwentyfive"
 }
 `,
-				ExpectError: regexp.MustCompile(`is active`),
+				Check: func(*terraform.State) error {
+					if !server.Package("acmedev", "themes", "twentytwentythree").Installed {
+						return fmt.Errorf("twentytwentythree was deleted")
+					}
+					return nil
+				},
 			},
-			{Config: theme("twentytwentyfive")},
-		},
-		CheckDestroy: func(*terraform.State) error {
-			if server.Package("acmedev", "themes", "twentytwentythree").Installed {
-				return fmt.Errorf("twentytwentythree not deleted")
-			}
-			return nil
 		},
 	})
 }
