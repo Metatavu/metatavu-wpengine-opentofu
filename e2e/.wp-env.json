@@ -1,0 +1,12 @@
+{
+	"core": null,
+	"phpVersion": "8.4",
+	"plugins": [],
+	"mappings": {
+		"wp-content/mu-plugins/metatavu-wordpress-iac.php": "./build/plugin/metatavu-wordpress-iac.php",
+		"wp-content/mu-plugins/metatavu-wordpress-iac": "./build/plugin/metatavu-wordpress-iac"
+	},
+	"config": {
+		"WP_ENVIRONMENT_TYPE": "local"
+	}
+}

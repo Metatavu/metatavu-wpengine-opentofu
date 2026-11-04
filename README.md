@@ -2,7 +2,6 @@
 
 OpenTofu provider for WP Engine hosting and the WordPress configuration behind it: `wpengine_*` resources through the [WP Engine API](https://wpengineapi.com/reference), and `wpengine_wordpress_*` resources through [metatavu-wordpress-iac](https://github.com/Metatavu/metatavu-wordpress-iac).
 
-Work in progress: every resource is in place; end-to-end tests against the released mu-plugin follow.
 
 ## Installing
 
@@ -47,7 +46,7 @@ Each setting can also come from its environment variable.
 
 The platform credentials are used only from a laptop, in a project's `bootstrap/`. A configuration without them works until it uses a platform resource.
 
-The `wpengine_wordpress_*` resources reach the [IaC mu-plugin](https://github.com/Metatavu/metatavu-wordpress-iac) on each install at `https://<install>.wpengine.com/?rest_route=/metatavu-iac/v1/…`, with GitHub Actions OIDC tokens whose audience is that base URL. They work only in a GitHub Actions job with `permissions: id-token: write`, in a GitHub environment the install's plugin trusts; anywhere else they fail with "site/ is applied only by CI". A read token is reused within a run; every write gets a fresh one, because the plugin accepts a write token once.
+The `wpengine_wordpress_*` resources reach the [IaC mu-plugin](https://github.com/Metatavu/metatavu-wordpress-iac) on each install at `https://<install>.wpengine.com/?rest_route=/metatavu-iac/v1/…`, with GitHub Actions OIDC tokens whose audience is that base URL. They work only in a GitHub Actions job with `permissions: id-token: write`, in a GitHub environment the install's plugin trusts; anywhere else they fail with "site/ is applied only by CI". A read token is reused within a run; every write gets a fresh one, because the plugin accepts a write token once. Writes to one install go one at a time, because WordPress keeps shared state such as the active plugins in single options.
 
 ## Resources
 
@@ -131,5 +130,7 @@ go test ./...
 ```
 
 The resource tests run OpenTofu (`tofu` on the `PATH`) against in-memory stand-ins: for the IaC mu-plugin (`internal/fake/wordpress`), which accepts a write token once, and for the WP Engine API (`internal/fake/wpengine`), which refuses request fields that aren't in the API's OpenAPI document. `internal/openapi/fields.go` lists those fields; regenerate it from the live document with `go generate ./internal/openapi`, and the tests then show any field the provider uses that the API no longer has.
+
+End to end, `e2e/run.sh` runs the provider with OpenTofu against WordPress in wp-env with the released IaC mu-plugin, signing tokens as the plugin's test issuer (`e2e/token`): it applies every WordPress resource in `e2e/site`, checks the site with WP-CLI, changes things in WordPress and checks that the plan shows them and the apply puts them back, updates a release, and destroys. It needs Docker, Node, OpenTofu, Go, curl, zip and python3; CI runs it on every pull request. `E2E_PLUGIN_ZIP` runs it against a locally built plugin instead.
 
 Releases are built by goreleaser from a `v*` tag on `main`.

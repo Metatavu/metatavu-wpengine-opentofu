@@ -1,3 +1,7 @@
 dist/
 /terraform-provider-wpengine*
 .DS_Store
+/e2e/build/
+/e2e/site/.terraform*
+/e2e/site/terraform.tfstate*
+/e2e/site/.terraform.lock.hcl

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,82 @@ func TestActionsTokensAskGitHubForTheAudience(t *testing.T) {
 	if err != nil || token != "oidc-token" || gotAuth != "bearer request-token" || gotAudience != "https://acmedev.wpengine.com" {
 		t.Fatalf("token %q, err %v, auth %q, audience %q", token, err, gotAuth, gotAudience)
 	}
+}
+
+func TestAResponseThatIsNotJSONIsExplained(t *testing.T) {
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<div id="error"><p class="wpdberror">WordPress database error</p></div>{"exists": true}`)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).PutOption(context.Background(), "acmedev", "a", "1")
+	if err == nil || !strings.Contains(err.Error(), "something other than JSON") || !strings.Contains(err.Error(), "wpdberror") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestValidJSONOfTheWrongShapeKeepsItsError(t *testing.T) {
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"wp_version": 6.9}`)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).State(context.Background(), "acmedev")
+	if err == nil || strings.Contains(err.Error(), "other than JSON") || !strings.Contains(err.Error(), "wp_version") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// A queued write gets its token when its turn comes, not while it waits.
+func TestAQueuedWriteGetsItsTokenWhenItsTurnComes(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	release := make(chan struct{})
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		events = append(events, "request "+r.Header.Get("Authorization"))
+		first := len(events) == 2
+		mu.Unlock()
+		if first {
+			<-release
+		}
+		fmt.Fprint(w, `{"exists": true}`)
+	}))
+	defer plugin.Close()
+	tokens := tokenFunc(func(string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, fmt.Sprintf("token %d", len(events)))
+		return fmt.Sprintf("t%d", len(events))
+	})
+	client := New(map[string]string{"acmedev": plugin.URL}, tokens, nil)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); _, _ = client.PutOption(context.Background(), "acmedev", "a", "1") }()
+	for {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); _, _ = client.PutOption(context.Background(), "acmedev", "b", "2") }()
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	queued := len(events)
+	mu.Unlock()
+	close(release)
+	wg.Wait()
+	if queued != 2 {
+		t.Fatalf("the queued write got a token while waiting: %v", events)
+	}
+}
+
+type tokenFunc func(audience string) string
+
+func (f tokenFunc) Token(_ context.Context, audience string) (string, error) {
+	return f(audience), nil
 }
 
 func TestOutsideActionsThereAreNoTokens(t *testing.T) {
@@ -72,6 +149,36 @@ func TestConcurrentReadsShareOneRequest(t *testing.T) {
 	wg.Wait()
 	if reads.Load() != 1 {
 		t.Fatalf("%d reads", reads.Load())
+	}
+}
+
+func TestWritesToAnInstallAreOneAtATime(t *testing.T) {
+	var inFlight, most atomic.Int32
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		for {
+			seen := most.Load()
+			if now <= seen || most.CompareAndSwap(seen, now) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inFlight.Add(-1)
+		fmt.Fprint(w, `{"exists": true}`)
+	}))
+	defer plugin.Close()
+	client := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = client.PutOption(context.Background(), "acmedev", fmt.Sprint("option", i), "1")
+		}(i)
+	}
+	wg.Wait()
+	if most.Load() != 1 {
+		t.Fatalf("%d writes at once", most.Load())
 	}
 }
 
