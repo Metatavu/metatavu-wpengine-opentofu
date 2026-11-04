@@ -16,7 +16,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
 plugin_version=0.2.1
-plugin_sha256=RELEASE_SHA256_OF_0_2_1
+plugin_sha256=216506f438040e4b992b288ccdc9eb88440a07e5ff9539544c31c23c543a53bd
 port=${WP_ENV_PORT:-8888}
 releases_port=${E2E_RELEASES_PORT:-8897}
 site=http://localhost:$port
