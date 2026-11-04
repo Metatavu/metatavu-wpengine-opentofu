@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,17 @@ func TestActionsTokensAskGitHubForTheAudience(t *testing.T) {
 	token, err := ActionsTokens(nil).Token(context.Background(), "https://acmedev.wpengine.com")
 	if err != nil || token != "oidc-token" || gotAuth != "bearer request-token" || gotAudience != "https://acmedev.wpengine.com" {
 		t.Fatalf("token %q, err %v, auth %q, audience %q", token, err, gotAuth, gotAudience)
+	}
+}
+
+func TestAResponseThatIsNotJSONIsExplained(t *testing.T) {
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<div id="error"><p class="wpdberror">WordPress database error</p></div>{"exists": true}`)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).PutOption(context.Background(), "acmedev", "a", "1")
+	if err == nil || !strings.Contains(err.Error(), "something other than JSON") || !strings.Contains(err.Error(), "wpdberror") {
+		t.Fatalf("err %v", err)
 	}
 }
 
@@ -72,6 +84,36 @@ func TestConcurrentReadsShareOneRequest(t *testing.T) {
 	wg.Wait()
 	if reads.Load() != 1 {
 		t.Fatalf("%d reads", reads.Load())
+	}
+}
+
+func TestWritesToAnInstallAreOneAtATime(t *testing.T) {
+	var inFlight, most atomic.Int32
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := inFlight.Add(1)
+		for {
+			seen := most.Load()
+			if now <= seen || most.CompareAndSwap(seen, now) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		inFlight.Add(-1)
+		fmt.Fprint(w, `{"exists": true}`)
+	}))
+	defer plugin.Close()
+	client := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = client.PutOption(context.Background(), "acmedev", fmt.Sprint("option", i), "1")
+		}(i)
+	}
+	wg.Wait()
+	if most.Load() != 1 {
+		t.Fatalf("%d writes at once", most.Load())
 	}
 }
 

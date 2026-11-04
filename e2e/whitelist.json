@@ -1,0 +1,9 @@
+{
+	"options": {
+		"blogdescription": {},
+		"posts_per_page": {},
+		"acme_api": { "sensitive": true }
+	},
+	"plugins": ["classic-editor", "acme-release"],
+	"themes": ["twentytwentyfive", "twentytwentythree"]
+}

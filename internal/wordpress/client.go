@@ -111,6 +111,11 @@ type installCache struct {
 	lock       sync.Mutex
 	state      *State
 	generation int
+
+	// writing lets one write at a time reach the install: WordPress keeps
+	// shared state such as active_plugins in single options, and concurrent
+	// activations would overwrite each other's.
+	writing sync.Mutex
 }
 
 type cachedToken struct {
@@ -200,6 +205,9 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 		return err
 	}
 	if write {
+		cache := c.cache(install)
+		cache.writing.Lock()
+		defer cache.writing.Unlock()
 		c.invalidate(install)
 		defer c.invalidate(install)
 	}
@@ -233,9 +241,22 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 		return apiErr
 	}
 	if out != nil {
-		return json.Unmarshal(raw, out)
+		if err := json.Unmarshal(raw, out); err != nil {
+			return fmt.Errorf("the IaC plugin on %s answered %s %s with something other than JSON, starting %q: "+
+				"something on the site printed output before the response, such as a PHP notice or a database error shown with WP_DEBUG; see the site's error log",
+				install, method, path, preview(raw))
+		}
 	}
 	return nil
+}
+
+// preview is the start of a response, for an error message.
+func preview(raw []byte) string {
+	text := strings.Join(strings.Fields(string(raw)), " ")
+	if len(text) > 120 {
+		text = text[:120] + "…"
+	}
+	return text
 }
 
 // token returns a write token fresh, and a read token reused while it has a
