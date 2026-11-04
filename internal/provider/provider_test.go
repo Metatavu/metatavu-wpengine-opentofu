@@ -27,7 +27,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("TF_ACC_PROVIDER_HOST") == "" {
 		os.Setenv("TF_ACC_PROVIDER_HOST", "registry.opentofu.org")
 	}
-	for _, variable := range []string{"WPENGINE_API_URL", "WPENGINE_API_USERNAME", "WPENGINE_API_PASSWORD"} {
+	for _, variable := range []string{"WPENGINE_API_URL", "WPENGINE_API_USERNAME", "WPENGINE_API_PASSWORD", "WPENGINE_WORDPRESS_TOKEN_COMMAND", "WPENGINE_RELEASE_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"} {
 		os.Unsetenv(variable)
 	}
 	installPollInterval = 10 * time.Millisecond
