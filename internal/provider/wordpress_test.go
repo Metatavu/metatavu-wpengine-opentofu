@@ -226,7 +226,7 @@ func TestOnePlanReadsAnInstallOnce(t *testing.T) {
 		Steps: []resource.TestStep{
 			{Config: options(server, "Hello", "s3cr3t")},
 			{
-				PreConfig: func() { server.StateReads["acmedev"] = 0 },
+				PreConfig: func() { server.StateReads["acmedev"], server.StateReadsByToken["acmedev"] = 0, nil },
 				Config:    options(server, "Hello", "s3cr3t"),
 				PlanOnly:  true,
 				Check: func(*terraform.State) error {
@@ -363,6 +363,89 @@ resource "wpengine_wordpress_active_theme" "acmedev" {
 			{
 				Config:      theme("unknown"),
 				ExpectError: regexp.MustCompile(`isn't on the whitelist`),
+			},
+		},
+	})
+}
+
+func TestAValueForASensitiveOptionIsRefusedWhenPlanning(t *testing.T) {
+	server := newWordPress(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config: wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_option" "api" {
+  install = "acmedev"
+  name    = "acme_api"
+  value   = jsonencode({ secret = "in the open" })
+}
+`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`(?s)is sensitive on acmedev.*sensitive_value`),
+			},
+		},
+	})
+	if server.Writes["acmedev"] != 0 {
+		t.Fatalf("%d writes", server.Writes["acmedev"])
+	}
+}
+
+// bootstrap/ changes an option's sensitivity, and the configuration follows:
+// the plan shows the change, the apply writes nothing (the value is the
+// same), and the next plan is empty. Both ways.
+func TestAnOptionMovesBetweenPublicAndSensitive(t *testing.T) {
+	server := newWordPress(t)
+	public := wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_option" "settings" {
+  install = "acmedev"
+  name    = "acme_settings"
+  value   = jsonencode({ mode = "strict" })
+}
+`
+	sensitive := wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_option" "settings" {
+  install         = "acmedev"
+  name            = "acme_settings"
+  sensitive_value = jsonencode({ mode = "strict" })
+}
+`
+	writes := 0
+	noWrites := func(*terraform.State) error {
+		if server.Writes["acmedev"] != writes {
+			return fmt.Errorf("%d writes", server.Writes["acmedev"]-writes)
+		}
+		return nil
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				Config: public,
+				Check:  func(*terraform.State) error { writes = server.Writes["acmedev"]; return nil },
+			},
+			{
+				PreConfig: func() { server.SetSensitive("acmedev", "acme_settings", true) },
+				Config:    sensitive,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction("wpengine_wordpress_option.settings", plancheck.ResourceActionUpdate)},
+				},
+				Check: noWrites,
+			},
+			{
+				Config:           sensitive,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
+			},
+			{
+				PreConfig: func() { server.SetSensitive("acmedev", "acme_settings", false) },
+				Config:    public,
+				Check:     noWrites,
+			},
+			{
+				Config:           public,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}},
 			},
 		},
 	})

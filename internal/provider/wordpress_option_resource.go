@@ -125,8 +125,35 @@ func (r *wordpressOptionResource) ModifyPlan(ctx context.Context, req resource.M
 		plan.ID = types.StringUnknown()
 	} else {
 		plan.ID = types.StringValue(plan.Install.ValueString() + "/" + plan.Name.ValueString())
+		// The declared mode must be the whitelist's: refused here, before anything is written.
+		if r.client != nil && !plan.Value.IsUnknown() && !plan.SensitiveValue.IsUnknown() {
+			if sensitive, err := r.client.Sensitive(ctx, plan.Install.ValueString()); err == nil {
+				if mismatch := modeMismatch(sensitive, plan); mismatch != nil {
+					resp.Diagnostics.Append(mismatch)
+					return
+				}
+			}
+		}
 	}
 	resp.Diagnostics.Append(resp.Plan.Set(ctx, plan)...)
+}
+
+// modeMismatch refuses a value for an option whitelisted as sensitive (its
+// state could hold only the hash), and a sensitive_value for a public one
+// (the plugin returns its value to every read token).
+func modeMismatch(sensitive map[string]bool, plan wordpressOptionModel) diag.Diagnostic {
+	install, name := plan.Install.ValueString(), plan.Name.ValueString()
+	isSensitive, ok := sensitive[name]
+	switch {
+	case !ok:
+		return nil
+	case isSensitive && plan.SensitiveValue.IsNull():
+		return diag.NewAttributeErrorDiagnostic(path.Root("value"), "Option "+name+" is sensitive on "+install,
+			"It's whitelisted as sensitive, so declare it with sensitive_value.")
+	case !isSensitive && !plan.SensitiveValue.IsNull():
+		return notSensitive(install, name)
+	}
+	return nil
 }
 
 func (r *wordpressOptionResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -173,18 +200,16 @@ func (r *wordpressOptionResource) write(ctx context.Context, plan wordpressOptio
 		diags.AddError("Invalid JSON", err.Error())
 		return
 	}
-	// A secret goes only to an option whitelisted as sensitive: the plugin
-	// returns any other option's value to every read token.
-	if !plan.SensitiveValue.IsNull() {
-		live, err := r.client.State(ctx, plan.Install.ValueString())
-		if err != nil {
-			addWordPressError(diags, "Reading "+plan.Install.ValueString()+" failed", err)
-			return
-		}
-		if option, ok := live.Options[plan.Name.ValueString()]; ok && !option.Sensitive {
-			diags.Append(notSensitive(plan.Install.ValueString(), plan.Name.ValueString()))
-			return
-		}
+	// Checked again right before writing: a secret goes only to an option
+	// whitelisted as sensitive, and a sensitive option only gets a secret.
+	sensitive, err := r.client.Sensitive(ctx, plan.Install.ValueString())
+	if err != nil {
+		addWordPressError(diags, "Reading "+plan.Install.ValueString()+" failed", err)
+		return
+	}
+	if mismatch := modeMismatch(sensitive, plan); mismatch != nil {
+		diags.Append(mismatch)
+		return
 	}
 	if _, err := r.client.PutOption(ctx, plan.Install.ValueString(), plan.Name.ValueString(), value); err != nil {
 		addWordPressError(diags, "Setting option "+plan.Name.ValueString()+" on "+plan.Install.ValueString()+" failed", err)
@@ -215,21 +240,17 @@ func (r *wordpressOptionResource) Read(ctx context.Context, req resource.ReadReq
 	}
 	state.ID = types.StringValue(install + "/" + name)
 
-	// A sensitive value is compared through its hash; the plugin returns only
-	// the hash for an option whitelisted as sensitive.
-	if !state.Value.IsNull() || (state.SensitiveValue.IsNull() && !option.Sensitive) {
-		if option.Sensitive {
-			resp.Diagnostics.AddError("Option "+name+" is sensitive on "+install, "It's whitelisted as sensitive, so declare it with sensitive_value.")
-			return
-		}
-		state.Value = optionJSONValue(string(option.Value))
-		state.SensitiveHash = types.StringNull()
-	} else {
-		if !option.Sensitive {
-			resp.Diagnostics.Append(notSensitive(install, name))
-			return
-		}
+	// The state records what's live, whatever the configuration declares: a
+	// sensitive option's hash, or a public option's value. So a change to the
+	// whitelist's sensitivity plans as a change, and the plan refuses a
+	// configuration that doesn't fit the whitelist (ModifyPlan).
+	if option.Sensitive {
+		state.Value = optionJSONNull()
 		state.SensitiveHash = types.StringValue(option.SHA256)
+	} else {
+		state.Value = optionJSONValue(string(option.Value))
+		state.SensitiveValue = optionJSONNull()
+		state.SensitiveHash = types.StringNull()
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
