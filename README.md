@@ -2,7 +2,7 @@
 
 OpenTofu provider for WP Engine hosting and the WordPress configuration behind it: `wpengine_*` resources through the [WP Engine API](https://wpengineapi.com/reference), and `wpengine_wordpress_*` resources through [metatavu-wordpress-iac](https://github.com/Metatavu/metatavu-wordpress-iac).
 
-Work in progress: the platform resources, options and the active theme are in place; WordPress plugins and themes follow.
+Work in progress: every resource is in place; end-to-end tests against the released mu-plugin follow.
 
 ## Installing
 
@@ -61,10 +61,29 @@ The `wpengine_wordpress_*` resources reach the [IaC mu-plugin](https://github.co
 | `wpengine_ssh_key` | An SSH public key of the API user, for WP Engine's SSH gateway | | `public_key` |
 | `wpengine_wordpress_option` | A whitelisted WordPress option, `value` or `sensitive_value` as JSON. Removing it leaves the value in WordPress | the value | `install`, `name` |
 | `wpengine_wordpress_active_theme` | An install's active theme, which must be whitelisted and installed. Removing it leaves the theme active | `slug` | `install` |
+| `wpengine_wordpress_plugin` | A whitelisted plugin: from wordpress.org by slug (WP Engine keeps it up to date), or a `release` zip at `url` with its `version` and `sha256`. Destroying it deactivates and deletes it | `active`, and a release's `url`, `version`, `sha256` | `install`, `slug`, `source` |
+| `wpengine_wordpress_theme` | A whitelisted theme, the same way; `active` tells whether it's the active theme. The active theme can't be deleted | a release's `url`, `version`, `sha256` | `install`, `slug`, `source` |
+
+A release zip is downloaded in CI, with `release_token` for private GitHub releases (when github.com doesn't serve an asset, it comes through GitHub's API), checked against `sha256` before anything is sent, and uploaded to the site, which checks it again. Changing a release plugin's `active` uploads the zip again. A release changed on the site (another version) shows as drift and is put back.
 
 An option's value is compared as WordPress stores it: a top-level number or boolean is a string (`12` is `"12"`, `true` is `"1"`), and `{}` is `[]`. A `sensitive_value` is compared through a hash and never appears in a plan. Each run reads an install's state once.
 
 ```hcl
+resource "wpengine_wordpress_plugin" "seo" {
+  install = "acmedev"
+  slug    = "wordpress-seo"
+  source  = "wordpress.org"
+}
+
+resource "wpengine_wordpress_theme" "acme" {
+  install = "acmedev"
+  slug    = "acme"
+  source  = "release"
+  url     = "https://github.com/acme/acme-theme/releases/download/v1.2.0/acme.zip"
+  version = "1.2.0"
+  sha256  = "<the zip's SHA-256>"
+}
+
 resource "wpengine_wordpress_option" "description" {
   install = "acmedev"
   name    = "blogdescription"
@@ -95,7 +114,7 @@ resource "wpengine_install" "development" {
 }
 ```
 
-Imports: an option as `<install>/<name>`, and the active theme by the install's name. Right after importing, an option whose value isn't spelled as WordPress stores it (a number, a boolean, `{}`), or a `sensitive_value`, shows an update once, and its apply writes nothing: OpenTofu compares the configuration with the imported state exactly, and only the provider knows they're the same. A site or an install by its ID or name; a domain as `<install>/<domain>` (each by ID or name); cache exclusions by the install's ID or name; an account user as `<account_id>/<email>` or `<account_id>/<user_id>`; an SSH key by its ID or fingerprint. An imported SSH key has no public key in state, because the API doesn't return it: the first plan after importing updates it in place when the declared key has the same fingerprint.
+Imports: an option as `<install>/<name>`, a plugin or theme as `<install>/<slug>`, and the active theme by the install's name. An imported release whose installed version is the declared one isn't uploaded again. Right after importing, an option whose value isn't spelled as WordPress stores it (a number, a boolean, `{}`), or a `sensitive_value`, shows an update once, and its apply writes nothing: OpenTofu compares the configuration with the imported state exactly, and only the provider knows they're the same. A site or an install by its ID or name; a domain as `<install>/<domain>` (each by ID or name); cache exclusions by the install's ID or name; an account user as `<account_id>/<email>` or `<account_id>/<user_id>`; an SSH key by its ID or fingerprint. An imported SSH key has no public key in state, because the API doesn't return it: the first plan after importing updates it in place when the declared key has the same fingerprint.
 
 ```hcl
 import {
