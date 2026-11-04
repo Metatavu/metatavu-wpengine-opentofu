@@ -121,7 +121,11 @@ func (r *wordpressOptionResource) ModifyPlan(ctx context.Context, req resource.M
 		}
 		plan.SensitiveHash = types.StringValue(wordpress.SHA256(normalised))
 	}
-	plan.ID = types.StringValue(plan.Install.ValueString() + "/" + plan.Name.ValueString())
+	if plan.Install.IsUnknown() || plan.Name.IsUnknown() {
+		plan.ID = types.StringUnknown()
+	} else {
+		plan.ID = types.StringValue(plan.Install.ValueString() + "/" + plan.Name.ValueString())
+	}
 	resp.Diagnostics.Append(resp.Plan.Set(ctx, plan)...)
 }
 
@@ -169,6 +173,19 @@ func (r *wordpressOptionResource) write(ctx context.Context, plan wordpressOptio
 		diags.AddError("Invalid JSON", err.Error())
 		return
 	}
+	// A secret goes only to an option whitelisted as sensitive: the plugin
+	// returns any other option's value to every read token.
+	if !plan.SensitiveValue.IsNull() {
+		live, err := r.client.State(ctx, plan.Install.ValueString())
+		if err != nil {
+			addWordPressError(diags, "Reading "+plan.Install.ValueString()+" failed", err)
+			return
+		}
+		if option, ok := live.Options[plan.Name.ValueString()]; ok && !option.Sensitive {
+			diags.Append(notSensitive(plan.Install.ValueString(), plan.Name.ValueString()))
+			return
+		}
+	}
 	if _, err := r.client.PutOption(ctx, plan.Install.ValueString(), plan.Name.ValueString(), value); err != nil {
 		addWordPressError(diags, "Setting option "+plan.Name.ValueString()+" on "+plan.Install.ValueString()+" failed", err)
 	}
@@ -208,18 +225,20 @@ func (r *wordpressOptionResource) Read(ctx context.Context, req resource.ReadReq
 		state.Value = optionJSONValue(string(option.Value))
 		state.SensitiveHash = types.StringNull()
 	} else {
-		hash := option.SHA256
 		if !option.Sensitive {
-			normalised, err := wordpress.Normalise(string(option.Value))
-			if err != nil {
-				resp.Diagnostics.AddError("Unreadable value of "+name, err.Error())
-				return
-			}
-			hash = wordpress.SHA256(normalised)
+			resp.Diagnostics.Append(notSensitive(install, name))
+			return
 		}
-		state.SensitiveHash = types.StringValue(hash)
+		state.SensitiveHash = types.StringValue(option.SHA256)
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
+}
+
+// notSensitive refuses a sensitive_value for an option the whitelist
+// doesn't mark as sensitive.
+func notSensitive(install, name string) diag.Diagnostic {
+	return diag.NewErrorDiagnostic("Option "+name+" isn't sensitive on "+install,
+		"The plugin returns its value to every read token, so it can't hold a secret. Whitelist it with sensitive = true in the project's bootstrap/ and apply that first, or declare it with value.")
 }
 
 // Delete leaves the value in WordPress: removing a plugin's settings can

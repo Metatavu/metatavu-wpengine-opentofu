@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,7 +25,8 @@ func Normalise(raw string) (any, error) {
 	if err := decoder.Decode(&value); err != nil {
 		return nil, fmt.Errorf("not JSON: %w", err)
 	}
-	if decoder.More() {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
 		return nil, fmt.Errorf("not one JSON value")
 	}
 	return normalise(value, true), nil
@@ -48,7 +51,7 @@ func normalise(value any, top bool) any {
 		if top {
 			return number(v)
 		}
-		return v
+		return json.Number(number(v))
 	case []any:
 		out := make([]any, len(v))
 		for i, item := range v {
@@ -82,7 +85,10 @@ func normalise(value any, top bool) any {
 	}
 }
 
-// number is a JSON number as PHP prints it as a string.
+// number is a JSON number as PHP prints it: an integer as an integer, and a
+// float without a zero fraction (json_encode without
+// JSON_PRESERVE_ZERO_FRACTION), so 1, 1.0 and 1e0 are all 1. Floats in
+// exponent form beyond 1e15 may still differ from PHP's spelling.
 func number(n json.Number) string {
 	if i, err := n.Int64(); err == nil {
 		return strconv.FormatInt(i, 10)
@@ -90,6 +96,9 @@ func number(n json.Number) string {
 	f, err := n.Float64()
 	if err != nil {
 		return n.String()
+	}
+	if f == math.Trunc(f) && math.Abs(f) < 1e15 {
+		return strconv.FormatInt(int64(f), 10)
 	}
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }

@@ -245,8 +245,11 @@ func canonical(value any) string {
 		}
 		return "[" + strings.Join(parts, ",") + "]"
 	default:
-		encoded, _ := json.Marshal(v)
-		return string(encoded)
+		var encoded strings.Builder
+		encoder := json.NewEncoder(&encoded)
+		encoder.SetEscapeHTML(false)
+		_ = encoder.Encode(v)
+		return strings.TrimRight(encoded.String(), "\n")
 	}
 }
 

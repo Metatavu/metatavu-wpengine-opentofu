@@ -30,10 +30,30 @@ func TestNormaliseTopLevelScalarsAsWordPressStoresThem(t *testing.T) {
 }
 
 func TestNormaliseRefusesWhatIsNotOneJSONValue(t *testing.T) {
-	for _, in := range []string{``, `{`, `1 2`, `nope`} {
+	for _, in := range []string{``, `{`, `1 2`, `nope`, `1]`, `{"a":1}}`, `"a" x`} {
 		if _, err := Normalise(in); err == nil {
 			t.Errorf("%q: no error", in)
 		}
+	}
+}
+
+func TestNumbersAreSpelledAsPHPEncodesThem(t *testing.T) {
+	cases := map[string]string{
+		`1.0`:                      `"1"`,
+		`1e2`:                      `"100"`,
+		`{"n":1.0,"m":[1e0,2.50]}`: `{"m":[1,2.5],"n":1}`,
+	}
+	for in, want := range cases {
+		value, err := Normalise(in)
+		if err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		if got := Canonical(value); got != want {
+			t.Errorf("%s: got %s, want %s", in, got, want)
+		}
+	}
+	if !Equal(`{"n":1.0}`, `{"n":1}`) {
+		t.Fatal("1.0 and 1 differ")
 	}
 }
 

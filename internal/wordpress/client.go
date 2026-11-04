@@ -36,6 +36,9 @@ func ActionsTokens(httpClient *http.Client) TokenSource {
 	if requestURL == "" || requestToken == "" {
 		return nil
 	}
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: time.Minute}
+	}
 	return &actionsTokens{url: requestURL, token: requestToken, http: httpClient}
 }
 
@@ -97,8 +100,17 @@ type Client struct {
 	http      *http.Client
 
 	mu         sync.Mutex
-	states     map[string]*State
+	installs   map[string]*installCache
 	readTokens map[string]cachedToken
+}
+
+// installCache is one install's state. Reading holds lock, so concurrent
+// reads wait for one request; generation changes around every write, so a
+// read that overlapped a write isn't kept.
+type installCache struct {
+	lock       sync.Mutex
+	state      *State
+	generation int
 }
 
 type cachedToken struct {
@@ -112,7 +124,7 @@ func New(endpoints map[string]string, tokens TokenSource, httpClient *http.Clien
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 5 * time.Minute}
 	}
-	return &Client{endpoints: endpoints, tokens: tokens, http: httpClient, states: map[string]*State{}, readTokens: map[string]cachedToken{}}
+	return &Client{endpoints: endpoints, tokens: tokens, http: httpClient, installs: map[string]*installCache{}, readTokens: map[string]cachedToken{}}
 }
 
 // BaseURL is an install's base URL, the tokens' audience (provider D4).
@@ -126,20 +138,41 @@ func (c *Client) BaseURL(install string) string {
 // State reads an install's managed state, once per plan (provider D11):
 // writes invalidate it.
 func (c *Client) State(ctx context.Context, install string) (*State, error) {
-	c.mu.Lock()
-	cached := c.states[install]
-	c.mu.Unlock()
-	if cached != nil {
-		return cached, nil
+	cache := c.cache(install)
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+	if cache.state != nil {
+		return cache.state, nil
 	}
+	generation := cache.generation
 	var state State
 	if err := c.do(ctx, install, http.MethodGet, "/state", nil, "", &state, false); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	c.states[install] = &state
-	c.mu.Unlock()
+	if cache.generation == generation {
+		cache.state = &state
+	}
 	return &state, nil
+}
+
+func (c *Client) cache(install string) *installCache {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cache, ok := c.installs[install]
+	if !ok {
+		cache = &installCache{}
+		c.installs[install] = cache
+	}
+	return cache
+}
+
+// invalidate forgets an install's state, before and after a write.
+func (c *Client) invalidate(install string) {
+	cache := c.cache(install)
+	cache.lock.Lock()
+	cache.state = nil
+	cache.generation++
+	cache.lock.Unlock()
 }
 
 // PutOption sets a whitelisted option to a normalised value.
@@ -167,9 +200,8 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 		return err
 	}
 	if write {
-		c.mu.Lock()
-		delete(c.states, install)
-		c.mu.Unlock()
+		c.invalidate(install)
+		defer c.invalidate(install)
 	}
 	endpoint := c.BaseURL(install) + "/?rest_route=" + url.QueryEscape(Namespace+path)
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)

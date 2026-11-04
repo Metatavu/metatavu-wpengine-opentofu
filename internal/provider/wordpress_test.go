@@ -192,7 +192,8 @@ import {
 
 func TestImportingASensitiveOptionWritesNothing(t *testing.T) {
 	server := newWordPress(t)
-	server.SetOption("acmedev", "acme_api", map[string]any{"url": "https://api.example.com/", "secret": "s3cr3t"})
+	// Characters JSON encoders escape by default: the provider, the plugin and the fake leave them as they are.
+	server.SetOption("acmedev", "acme_api", map[string]any{"url": "https://api.example.com/?a=1&b=<2>", "secret": "s3cr3t"})
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: factories,
@@ -206,7 +207,7 @@ import {
 resource "wpengine_wordpress_option" "api" {
   install         = "acmedev"
   name            = "acme_api"
-  sensitive_value = jsonencode({ secret = "s3cr3t", url = "https://api.example.com/" })
+  sensitive_value = jsonencode({ secret = "s3cr3t", url = "https://api.example.com/?a=1&b=<2>" })
 }
 `,
 			},
@@ -262,6 +263,11 @@ func TestEveryWriteGetsAFreshToken(t *testing.T) {
 
 func TestWordPressErrors(t *testing.T) {
 	server := newWordPress(t)
+	t.Cleanup(func() {
+		if value, ok := server.Option("acmedev", "blogdescription"); ok {
+			t.Errorf("a refused write reached the plugin: %v", value)
+		}
+	})
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: factories,
@@ -296,6 +302,17 @@ resource "wpengine_wordpress_option" "not_json" {
 }
 `,
 				ExpectError: regexp.MustCompile(`Invalid JSON`),
+			},
+			{
+				// blogdescription is whitelisted as public: the plugin would hand the secret to every read token.
+				Config: wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_option" "secret_in_public" {
+  install         = "acmedev"
+  name            = "blogdescription"
+  sensitive_value = jsonencode("s3cr3t")
+}
+`,
+				ExpectError: regexp.MustCompile(`(?s)isn't sensitive on acmedev.*sensitive = true`),
 			},
 			{
 				// Outside GitHub Actions, with no test token command.
