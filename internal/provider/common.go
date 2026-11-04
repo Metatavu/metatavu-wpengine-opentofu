@@ -2,12 +2,14 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/client"
+	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/wordpress"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -16,6 +18,33 @@ import (
 type providerData struct {
 	// platform is the WP Engine API client; nil without credentials.
 	platform *client.Client
+	// wordpress calls the IaC mu-plugin; it fails outside CI.
+	wordpress *wordpress.Client
+	// releaseToken downloads release zips from private GitHub releases.
+	releaseToken string
+}
+
+// configuredWordPress is the mu-plugin client the provider configured, for
+// Configure.
+func configuredWordPress(data any, diags *diag.Diagnostics) *wordpress.Client {
+	if data == nil {
+		return nil
+	}
+	d, ok := data.(*providerData)
+	if !ok {
+		diags.AddError("Unexpected provider data", fmt.Sprintf("Expected *providerData, got %T", data))
+		return nil
+	}
+	return d.wordpress
+}
+
+// addWordPressError explains a failed call to the mu-plugin.
+func addWordPressError(diags *diag.Diagnostics, summary string, err error) {
+	if errors.Is(err, wordpress.ErrNotInCI) {
+		diags.AddError("Not in CI", err.Error())
+		return
+	}
+	diags.AddError(summary, err.Error())
 }
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
