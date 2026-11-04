@@ -3,7 +3,10 @@
 // install is served at <URL>/<install>. Tokens are "test:<audience>:<nonce>":
 // the audience must be the install's base URL, and a write token works once,
 // as the plugin's jti check does. Values are stored as WordPress stores them,
-// and an uploaded release zip is checked against its declared SHA-256.
+// and an uploaded release zip is checked against its declared SHA-256. A
+// package must be installed first (Install, as the project's bootstrap/
+// does); a release update is staged, and installed when <install>/wp-cron.php
+// is requested, as WordPress's automatic updater does.
 package wordpress
 
 import (
@@ -32,8 +35,12 @@ type Server struct {
 	installs map[string]*install
 	used     map[string]bool
 
-	// WordPressOrg is the version wordpress.org offers of each slug.
-	WordPressOrg map[string]string
+	// FailUpdates makes the automatic updater fail a slug's staged update with
+	// the message, and HoldUpdates keeps it from running at all.
+	FailUpdates map[string]string
+	HoldUpdates bool
+	// CronRuns counts requests to wp-cron.php by install.
+	CronRuns map[string]int
 	// StateReads counts GET /state by install, and StateReadsByToken by
 	// install and read token: one provider process reuses its read token.
 	StateReads        map[string]int
@@ -50,17 +57,20 @@ type install struct {
 	activeTheme string
 }
 
-// Package is a whitelisted plugin's or theme's state.
+// Package is a whitelisted plugin's or theme's state, with a staged update
+// that isn't installed yet and its last failed attempt.
 type Package struct {
-	Installed bool
-	Version   string
-	Active    bool
+	Installed    bool
+	Version      string
+	Active       bool
+	Pending      string
+	PendingError string
 }
 
 // New starts a stand-in.
 func New() *Server {
 	s := &Server{
-		installs: map[string]*install{}, used: map[string]bool{}, WordPressOrg: map[string]string{},
+		installs: map[string]*install{}, used: map[string]bool{}, FailUpdates: map[string]string{}, CronRuns: map[string]int{},
 		StateReads: map[string]int{}, StateReadsByToken: map[string]map[string]int{}, Writes: map[string]int{}, Uploads: map[string]int{},
 	}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.handle))
@@ -90,6 +100,14 @@ func (s *Server) Whitelist(installName, kind string, slugs ...string) {
 	for _, slug := range slugs {
 		s.installs[installName].packages[kind][slug] = &Package{}
 	}
+}
+
+// Install installs a whitelisted package at a version, inactive, as the
+// project's bootstrap/ does over SSH.
+func (s *Server) Install(installName, kind, slug, version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	*s.installs[installName].packages[kind][slug] = Package{Installed: true, Version: version}
 }
 
 // Package returns a whitelisted package's state.
@@ -145,6 +163,14 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if name, ok := strings.CutSuffix(strings.Trim(r.URL.Path, "/"), "/wp-cron.php"); ok {
+		if in, ok := s.installs[name]; ok {
+			s.CronRuns[name]++
+			s.runUpdates(in)
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	name := strings.Trim(r.URL.Path, "/")
 	in, ok := s.installs[name]
 	route := r.URL.Query().Get("rest_route")
@@ -178,8 +204,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, in.state(name))
 	case method == http.MethodPut && len(parts) == 2 && parts[0] == "options":
 		in.putOption(w, r, parts[1])
-	case len(parts) == 2 && (parts[0] == "plugins" || parts[0] == "themes"):
-		s.putPackage(w, r, in, name, method, parts[0], parts[1])
+	case method == http.MethodPut && len(parts) == 2 && (parts[0] == "plugins" || parts[0] == "themes"):
+		s.putPackage(w, r, in, name, parts[0], parts[1])
 	case method == http.MethodPut && path == "/active-theme":
 		var body struct {
 			Slug string `json:"slug"`
@@ -221,24 +247,14 @@ func (in *install) putOption(w http.ResponseWriter, r *http.Request, escaped str
 	writeJSON(w, http.StatusOK, in.option(option))
 }
 
-func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install, name, method, kind, slug string) {
+func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install, name, kind, slug string) {
 	pkg, ok := in.packages[kind][slug]
 	if !ok {
 		writeError(w, http.StatusForbidden, "metatavu_iac_not_whitelisted", kind+" "+slug+" isn't on the whitelist.")
 		return
 	}
-	switch method {
-	case http.MethodDelete:
-		if kind == "themes" && in.activeTheme == slug {
-			writeError(w, http.StatusConflict, "metatavu_iac_active_theme", "Theme "+slug+" is active.")
-			return
-		}
-		*pkg = Package{}
-		writeJSON(w, http.StatusOK, packageState(kind, pkg))
-		return
-	case http.MethodPut:
-	default:
-		writeError(w, http.StatusNotFound, "rest_no_route", "No route was found matching the URL and request method.")
+	if !pkg.Installed {
+		writeError(w, http.StatusConflict, "metatavu_iac_not_installed", kind+" "+slug+" isn't installed: install it with the project's bootstrap/ first.")
 		return
 	}
 
@@ -263,7 +279,11 @@ func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install,
 		if r.FormValue("active") != "" {
 			active, _ = strconv.ParseBool(r.FormValue("active"))
 		}
-		*pkg = Package{Installed: true, Version: r.FormValue("version"), Active: active && kind == "plugins"}
+		// A version other than the installed one is staged for the automatic updater.
+		pkg.Pending, pkg.PendingError = "", ""
+		if version := r.FormValue("version"); version != pkg.Version {
+			pkg.Pending = version
+		}
 		s.Uploads[name]++
 	} else {
 		var body struct {
@@ -277,17 +297,35 @@ func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install,
 		if body.Active != nil {
 			active = *body.Active
 		}
-		if !pkg.Installed {
-			version, ok := s.WordPressOrg[slug]
-			if !ok {
-				writeError(w, http.StatusUnprocessableEntity, "metatavu_iac_not_on_wordpress_org", slug+" isn't on wordpress.org.")
-				return
-			}
-			pkg.Installed, pkg.Version = true, version
-		}
-		pkg.Active = active && kind == "plugins"
+		// A release declared earlier is forgotten.
+		pkg.Pending, pkg.PendingError = "", ""
 	}
-	writeJSON(w, http.StatusOK, packageState(kind, pkg))
+	pkg.Active = active && kind == "plugins"
+	status := http.StatusOK
+	if pkg.Pending != "" {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, packageState(kind, pkg))
+}
+
+// runUpdates installs staged updates, as WordPress's automatic updater does
+// on WP-Cron.
+func (s *Server) runUpdates(in *install) {
+	if s.HoldUpdates {
+		return
+	}
+	for _, slugs := range in.packages {
+		for slug, pkg := range slugs {
+			if pkg.Pending == "" {
+				continue
+			}
+			if message, fail := s.FailUpdates[slug]; fail {
+				pkg.PendingError = message
+				continue
+			}
+			pkg.Version, pkg.Pending, pkg.PendingError = pkg.Pending, "", ""
+		}
+	}
 }
 
 func packageState(kind string, pkg *Package) map[string]any {
@@ -298,6 +336,13 @@ func packageState(kind string, pkg *Package) map[string]any {
 	state := map[string]any{"installed": pkg.Installed, "version": version}
 	if kind == "plugins" {
 		state["active"] = pkg.Active
+	}
+	if pkg.Pending != "" {
+		var failure any
+		if pkg.PendingError != "" {
+			failure = pkg.PendingError
+		}
+		state["pending"] = map[string]any{"version": pkg.Pending, "error": failure}
 	}
 	return state
 }

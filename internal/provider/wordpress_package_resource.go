@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/wordpress"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -58,6 +60,11 @@ const (
 	sourceRelease      = "release"
 )
 
+// releaseWait is how an update's apply waits for WordPress's automatic
+// updater (provider D21): WP-Cron is run, then the state read, every
+// interval, until timeout. Tests shorten it.
+var releaseWait = struct{ interval, timeout time.Duration }{10 * time.Second, 10 * time.Minute}
+
 func (r *wordpressPackageResource) noun() string {
 	if r.kind == wordpress.Plugins {
 		return "plugin"
@@ -80,7 +87,7 @@ func (r *wordpressPackageResource) Schema(_ context.Context, _ resource.SchemaRe
 		"slug":    schema.StringAttribute{Required: true, MarkdownDescription: "The " + r.noun() + "'s directory name.", PlanModifiers: replace},
 		"source": schema.StringAttribute{
 			Required:            true,
-			MarkdownDescription: "`wordpress.org`, installed by slug and kept up to date by WP Engine, or `release`, a zip at `url` with its `version` and `sha256`. Changing it replaces the " + r.noun() + ".",
+			MarkdownDescription: "`wordpress.org`, kept up to date by WP Engine, or `release`, a zip at `url` with its `version` and `sha256`. Changing it replaces the " + r.noun() + ".",
 			Validators:          []validator.String{stringvalidator.OneOf(sourceWordPressOrg, sourceRelease)},
 			// An imported package has no source in state: it's adopted, not replaced.
 			PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplaceIf(
@@ -92,7 +99,7 @@ func (r *wordpressPackageResource) Schema(_ context.Context, _ resource.SchemaRe
 		},
 		"url": schema.StringAttribute{
 			Optional:            true,
-			MarkdownDescription: "A release's zip. The provider downloads it in CI (with `release_token` for private GitHub releases), checks its `sha256`, and uploads it to the site.",
+			MarkdownDescription: "A release's zip. The provider downloads it in CI (with `release_token` for private GitHub releases), checks its `sha256`, and uploads it to the site, where WordPress's automatic updater installs it: the apply waits for that.",
 		},
 		"version": schema.StringAttribute{
 			Optional:            true,
@@ -108,7 +115,7 @@ func (r *wordpressPackageResource) Schema(_ context.Context, _ resource.SchemaRe
 			MarkdownDescription: "The version installed, which WP Engine keeps up to date for wordpress.org packages.",
 		},
 	}
-	description := "A whitelisted " + r.noun() + " on an install, through the IaC mu-plugin. Destroying it "
+	description := "A whitelisted " + r.noun() + " on an install, through the IaC mu-plugin. The project's bootstrap/ installs and removes it over SSH; this resource takes it over (provider D20). Destroying it "
 	if r.kind == wordpress.Plugins {
 		attributes["active"] = schema.BoolAttribute{
 			Optional:            true,
@@ -116,16 +123,16 @@ func (r *wordpressPackageResource) Schema(_ context.Context, _ resource.SchemaRe
 			Default:             booldefault.StaticBool(true),
 			MarkdownDescription: "Whether the plugin is active. Changing it for a release uploads the zip again.",
 		}
-		description += "deactivates and deletes the plugin."
+		description += "deactivates the plugin and leaves it installed."
 	} else {
 		attributes["active"] = schema.BoolAttribute{
 			Computed:            true,
 			MarkdownDescription: "Whether it's the active theme, which `wpengine_wordpress_active_theme` sets.",
 		}
-		description += "deletes the theme; the active theme can't be deleted."
+		description += "leaves the theme installed."
 	}
 	resp.Schema = schema.Schema{
-		MarkdownDescription: description + " Import as `<install>/<slug>`: an imported package whose installed version is the declared one isn't reinstalled.",
+		MarkdownDescription: description + " Import as `<install>/<slug>`: an imported package whose installed version is the declared one isn't uploaded again.",
 		Attributes:          attributes,
 	}
 }
@@ -193,7 +200,8 @@ func (r *wordpressPackageResource) Update(ctx context.Context, req resource.Upda
 	}
 }
 
-// install installs, updates or (de)activates the package as planned.
+// install takes over the package, updates a release, and (de)activates a
+// plugin, as planned. A release WordPress hasn't installed yet is waited for.
 func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressPackageModel, diags *diag.Diagnostics) {
 	install, slug := plan.Install.ValueString(), plan.Slug.ValueString()
 	active := r.kind == wordpress.Plugins && plan.Active.ValueBool()
@@ -202,7 +210,7 @@ func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressP
 		err   error
 	)
 	if plan.Source.ValueString() == sourceWordPressOrg {
-		state, err = r.client.InstallFromWordPressOrg(ctx, install, r.kind, slug, active)
+		state, err = r.client.AdoptFromWordPressOrg(ctx, install, r.kind, slug, active)
 	} else {
 		zip, downloadErr := wordpress.DownloadRelease(ctx, r.client.HTTP(), plan.URL.ValueString(), plan.SHA256.ValueString(), r.releaseToken)
 		if downloadErr != nil {
@@ -212,11 +220,18 @@ func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressP
 		state, err = r.client.UploadRelease(ctx, install, r.kind, slug, zip, plan.Version.ValueString(), plan.SHA256.ValueString(), active)
 	}
 	if err != nil {
-		addWordPressError(diags, "Installing "+r.noun()+" "+slug+" on "+install+" failed", err)
+		addWordPressError(diags, "Taking over "+r.noun()+" "+slug+" on "+install+" failed", err)
 		return
 	}
+	version := state.Version
+	if state.Pending != nil {
+		version = r.awaitUpdate(ctx, install, slug, state.Pending.Version, diags)
+		if diags.HasError() {
+			return
+		}
+	}
 	plan.ID = types.StringValue(install + "/" + slug)
-	plan.InstalledVersion = stringValue(state.Version)
+	plan.InstalledVersion = stringValue(version)
 	if r.kind == wordpress.Themes {
 		live, err := r.client.State(ctx, install)
 		if err != nil {
@@ -225,6 +240,55 @@ func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressP
 		}
 		plan.Active = types.BoolValue(live.ActiveTheme == slug)
 	}
+}
+
+// awaitUpdate runs WP-Cron until WordPress's automatic updater has installed
+// the staged version, and returns it (provider D21). A failed attempt the
+// plugin reports, or the timeout, fails the apply; the next plan shows the
+// update again.
+func (r *wordpressPackageResource) awaitUpdate(ctx context.Context, install, slug, version string, diags *diag.Diagnostics) *string {
+	summary := "WordPress didn't install " + r.noun() + " " + slug + " " + version + " on " + install
+	deadline := time.Now().Add(releaseWait.timeout)
+	for {
+		if err := r.client.RunCron(ctx, install); err != nil {
+			diags.AddError(summary, err.Error())
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			diags.AddError(summary, ctx.Err().Error())
+			return nil
+		case <-time.After(releaseWait.interval):
+		}
+		live, err := r.client.FreshState(ctx, install)
+		if err != nil {
+			addWordPressError(diags, "Reading "+install+" failed", err)
+			return nil
+		}
+		installed, pending := r.packageVersion(live, slug)
+		switch {
+		case pending == nil && installed != nil && *installed == version:
+			return installed
+		case pending != nil && pending.Error != nil:
+			diags.AddError(summary, "WordPress's automatic updater failed: "+*pending.Error+
+				" The previous version is still installed, and WordPress tries again on its next run; the next plan shows the update until then.")
+			return nil
+		case time.Now().After(deadline):
+			diags.AddError(summary, fmt.Sprintf("The update is still pending after %s. WordPress's automatic updater installs it on a later WP-Cron run; the next plan shows it until then.", releaseWait.timeout))
+			return nil
+		}
+	}
+}
+
+// packageVersion is a package's installed version and pending update in an
+// install's state.
+func (r *wordpressPackageResource) packageVersion(live *wordpress.State, slug string) (*string, *wordpress.Pending) {
+	if r.kind == wordpress.Plugins {
+		plugin := live.Plugins[slug]
+		return plugin.Version, plugin.Pending
+	}
+	theme := live.Themes[slug]
+	return theme.Version, theme.Pending
 }
 
 func (r *wordpressPackageResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -276,14 +340,18 @@ func (r *wordpressPackageResource) Read(ctx context.Context, req resource.ReadRe
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
 }
 
+// Delete deactivates a plugin and leaves the package installed: the
+// project's bootstrap/ removes it (provider D20). A release declared for it
+// is forgotten, so the plugin stops offering it to WordPress.
 func (r *wordpressPackageResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state wordpressPackageModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if err := r.client.DeletePackage(ctx, state.Install.ValueString(), r.kind, state.Slug.ValueString()); err != nil {
-		addWordPressError(&resp.Diagnostics, "Deleting "+r.noun()+" "+state.Slug.ValueString()+" failed", err)
+	_, err := r.client.AdoptFromWordPressOrg(ctx, state.Install.ValueString(), r.kind, state.Slug.ValueString(), false)
+	if err != nil && !wordpress.IsCode(err, "metatavu_iac_not_installed") {
+		addWordPressError(&resp.Diagnostics, "Releasing "+r.noun()+" "+state.Slug.ValueString()+" failed", err)
 	}
 }
 

@@ -23,26 +23,30 @@ const (
 
 // PackageState is a plugin's or theme's state after a write.
 type PackageState struct {
-	Installed bool    `json:"installed"`
-	Version   *string `json:"version"`
-	Active    bool    `json:"active"`
+	Installed bool     `json:"installed"`
+	Version   *string  `json:"version"`
+	Active    bool     `json:"active"`
+	Pending   *Pending `json:"pending"`
 }
 
-// InstallFromWordPressOrg installs a whitelisted package from wordpress.org
-// unless it's installed (WP Engine keeps it up to date), and sets whether a
-// plugin is active.
-func (c *Client) InstallFromWordPressOrg(ctx context.Context, install, kind, slug string, active bool) (*PackageState, error) {
+// AdoptFromWordPressOrg takes over a whitelisted package from wordpress.org
+// that the project's bootstrap/ has installed (WP Engine keeps it up to
+// date), and sets whether a plugin is active. The plugin forgets a release
+// declared for it earlier.
+func (c *Client) AdoptFromWordPressOrg(ctx context.Context, install, kind, slug string, active bool) (*PackageState, error) {
 	body := map[string]any{"source": "wordpress.org"}
 	if kind == Plugins {
 		body["active"] = active
 	}
 	encoded, _ := json.Marshal(body)
 	var state PackageState
-	return &state, c.do(ctx, install, http.MethodPut, "/"+kind+"/"+url.PathEscape(slug), bytes.NewReader(encoded), "application/json", &state, true, nil)
+	return &state, c.do(ctx, install, http.MethodPut, "/"+kind+"/"+url.PathEscape(slug), encoded, "application/json", &state, true, nil)
 }
 
 // UploadRelease uploads a release zip that was checked against its declared
-// SHA-256 (provider D7). PHP parses a multipart body only for POST, so it's
+// SHA-256 (provider D7) for an installed package. A version other than the
+// installed one is staged for WordPress's automatic updater and comes back
+// as Pending (plugin D19). PHP parses a multipart body only for POST, so it's
 // sent as POST with X-HTTP-Method-Override: PUT (plugin D16).
 func (c *Client) UploadRelease(ctx context.Context, install, kind, slug string, zip []byte, version, sha256 string, active bool) (*PackageState, error) {
 	var body bytes.Buffer
@@ -65,13 +69,25 @@ func (c *Client) UploadRelease(ctx context.Context, install, kind, slug string, 
 		return nil, err
 	}
 	var state PackageState
-	return &state, c.do(ctx, install, http.MethodPost, "/"+kind+"/"+url.PathEscape(slug), &body, form.FormDataContentType(), &state, true,
+	return &state, c.do(ctx, install, http.MethodPost, "/"+kind+"/"+url.PathEscape(slug), body.Bytes(), form.FormDataContentType(), &state, true,
 		map[string]string{"X-HTTP-Method-Override": http.MethodPut})
 }
 
-// DeletePackage deactivates a plugin and deletes the package.
-func (c *Client) DeletePackage(ctx context.Context, install, kind, slug string) error {
-	return c.do(ctx, install, http.MethodDelete, "/"+kind+"/"+url.PathEscape(slug), nil, "", nil, true, nil)
+// RunCron requests the install's wp-cron.php, as a visitor's page load
+// would, so WordPress's automatic updater installs a staged release (provider
+// D21). Without doing_wp_cron, which runs only WordPress's own lock.
+func (c *Client) RunCron(ctx context.Context, install string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL(install)+"/wp-cron.php", nil)
+	if err != nil {
+		return err
+	}
+	response, err := c.http.Do(request)
+	if err != nil {
+		return fmt.Errorf("running WP-Cron on %s: %w", install, err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, response.Body)
+	return nil
 }
 
 // GitHub's release download URLs, its API, and the origins the release
