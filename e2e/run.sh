@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
 # End-to-end tests: the provider, run by OpenTofu, against a local WordPress
-# (wp-env) with a released IaC mu-plugin and the test token issuer. Needs Go,
-# OpenTofu, Node (npx), Docker, curl, zip and python3; installing from
-# wordpress.org needs network access.
+# (wp-env) with a released IaC mu-plugin and the test token issuer. Packages
+# are installed with WP-CLI first, as a project's bootstrap/ does (plugin doc
+# D18), and a release update is installed by WordPress's automatic updater
+# within the apply (provider D21). Needs Go, OpenTofu, Node (npx), Docker,
+# curl, zip and python3; wordpress.org needs network access.
 #
 # Usage: WP_ENV_PORT=8888 e2e/run.sh
 #
@@ -15,8 +17,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
-plugin_version=0.2.1
-plugin_sha256=216506f438040e4b992b288ccdc9eb88440a07e5ff9539544c31c23c543a53bd
+plugin_version=0.3.0
+plugin_sha256=bb85202feb87dfa83f8cf72aa7495ee44ab3beb39cf62fd751b6bc7a133fc899
 port=${WP_ENV_PORT:-8888}
 releases_port=${E2E_RELEASES_PORT:-8897}
 site=http://localhost:$port
@@ -68,7 +70,7 @@ TOFURC
 export TF_CLI_CONFIG_FILE=$build/tofurc
 
 echo "== release zips, served locally"
-for version in 1.0.0 1.1.0; do
+for version in 0.9.0 1.0.0 1.1.0; do
 	mkdir -p "$build/release-$version/acme-release"
 	printf '<?php\n/**\n * Plugin Name: Acme Release\n * Version: %s\n */\n' "$version" >"$build/release-$version/acme-release/acme-release.php"
 	(cd "$build/release-$version" && zip -qrX "$build/releases/acme-release-$version.zip" acme-release)
@@ -111,6 +113,21 @@ theme_status() {
 	awk -F, -v slug="$1" '$1 == slug { print $2; found = 1 } END { if (!found) print "deleted" }' <<<"$list"
 }
 
+echo "== packages installed as bootstrap/ does"
+# Destroying leaves packages installed (provider D20), so earlier runs' are removed first.
+wp theme activate twentytwentyfive >/dev/null || true
+wp plugin deactivate classic-editor acme-release >/dev/null 2>&1 || true
+wp plugin delete classic-editor acme-release >/dev/null 2>&1 || true
+wp theme delete twentytwentythree >/dev/null 2>&1 || true
+wp option delete metatavu_iac_release_plugin_acme-release >/dev/null 2>&1 || true
+wp plugin install classic-editor >/dev/null
+wp theme install twentytwentythree >/dev/null
+# The CLI container sees the site's files, not this machine's, so the zip goes through wp-content.
+wp eval "file_put_contents( WP_CONTENT_DIR . '/e2e-package.zip', base64_decode( '$(base64 <"$build/releases/acme-release-0.9.0.zip" | tr -d '\n')' ) );" >/dev/null
+wp plugin install wp-content/e2e-package.zip >/dev/null
+wp eval "unlink( WP_CONTENT_DIR . '/e2e-package.zip' );" >/dev/null
+check "the release is installed at its first version, inactive" "$(wp plugin get acme-release --field=version) $(plugin_status acme-release)" "0.9.0 inactive"
+
 echo "== apply"
 tofu_run apply 1.0.0 -auto-approve >/dev/null
 expect_no_changes "the next plan has no changes" 1.0.0
@@ -118,7 +135,7 @@ check "an option" "$(wp option get blogdescription)" "Managed end to end"
 check "a number is stored as WordPress stores it" "$(wp option get posts_per_page)" 12
 check "the secret's URL keeps its & and its {} is []" "$(wp option get acme_api --format=json)" '{"flags":[],"secret":"s3cr3t&<x>","url":"https:\/\/api.example.com\/?a=1&b=2"}'
 check "a wordpress.org plugin, active" "$(plugin_status classic-editor)" active
-check "a release plugin, active" "$(wp plugin get acme-release --field=version) $(plugin_status acme-release)" "1.0.0 active"
+check "a release plugin, updated by WordPress within the apply, and active" "$(wp plugin get acme-release --field=version) $(plugin_status acme-release)" "1.0.0 active"
 check "the active theme" "$(wp option get stylesheet)" twentytwentythree
 
 echo "== drift made in wp-admin is shown and put back"
@@ -146,9 +163,9 @@ check "the change in wp-admin is logged" "$([[ ${changes:-0} -gt 0 ]] && echo ye
 echo "== destroy"
 tofu_run apply 1.1.0 -auto-approve -var active_theme=twentytwentyfive >/dev/null
 tofu_run destroy 1.1.0 -auto-approve -var active_theme=twentytwentyfive >/dev/null
-check "the wordpress.org plugin is deleted" "$(plugin_status classic-editor)" deleted
-check "the release plugin is deleted" "$(plugin_status acme-release)" deleted
-check "the theme is deleted" "$(theme_status twentytwentythree)" deleted
+check "the wordpress.org plugin is deactivated and left for bootstrap/" "$(plugin_status classic-editor)" inactive
+check "the release plugin is deactivated and left for bootstrap/" "$(plugin_status acme-release)" inactive
+check "the theme is left for bootstrap/" "$(theme_status twentytwentythree)" inactive
 check "the option is left in WordPress" "$(wp option get blogdescription)" "Managed end to end"
 
 if ((failures > 0)); then

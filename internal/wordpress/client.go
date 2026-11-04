@@ -22,6 +22,15 @@ import (
 // Namespace is the plugin's REST namespace.
 const Namespace = "/metatavu-iac/v1"
 
+// maintenanceWait is how long a request waits out WordPress's maintenance
+// mode, which covers the whole site while its automatic updater installs a
+// staged release (provider D21): the request is tried again every interval,
+// until timeout. Tests shorten it.
+var maintenanceWait = struct{ interval, timeout time.Duration }{5 * time.Second, 3 * time.Minute}
+
+// errMaintenance is WordPress's maintenance page instead of the plugin's answer.
+var errMaintenance = errors.New("the site is in WordPress's maintenance mode")
+
 // ErrNotInCI is the error outside GitHub Actions (provider D5).
 var ErrNotInCI = errors.New("site/ is applied only by CI: the WordPress resources need a GitHub Actions OIDC token, which exists only in a workflow with `permissions: id-token: write`")
 
@@ -169,6 +178,12 @@ func (c *Client) State(ctx context.Context, install string) (*State, error) {
 	return &state, nil
 }
 
+// FreshState reads an install's state again, for waiting on WordPress.
+func (c *Client) FreshState(ctx context.Context, install string) (*State, error) {
+	c.invalidate(install)
+	return c.State(ctx, install)
+}
+
 // Sensitive tells which whitelisted options are sensitive: name to
 // sensitivity. It reads the state only when no read has happened yet.
 func (c *Client) Sensitive(ctx context.Context, install string) (map[string]bool, error) {
@@ -211,19 +226,21 @@ func (c *Client) invalidate(install string) {
 func (c *Client) PutOption(ctx context.Context, install, name string, value any) (*OptionState, error) {
 	var option OptionState
 	body, _ := json.Marshal(map[string]any{"value": value})
-	return &option, c.do(ctx, install, http.MethodPut, "/options/"+url.PathEscape(name), bytes.NewReader(body), "application/json", &option, true, nil)
+	return &option, c.do(ctx, install, http.MethodPut, "/options/"+url.PathEscape(name), body, "application/json", &option, true, nil)
 }
 
 // PutActiveTheme activates a whitelisted, installed theme.
 func (c *Client) PutActiveTheme(ctx context.Context, install, slug string) error {
 	body, _ := json.Marshal(map[string]string{"slug": slug})
-	return c.do(ctx, install, http.MethodPut, "/active-theme", bytes.NewReader(body), "application/json", nil, true, nil)
+	return c.do(ctx, install, http.MethodPut, "/active-theme", body, "application/json", nil, true, nil)
 }
 
 // do calls the plugin through ?rest_route= (provider D18), which works with
 // any permalink setting. A write gets a fresh token (provider D17) and
-// invalidates the install's cached state. Bodies are never logged.
-func (c *Client) do(ctx context.Context, install, method, path string, body io.Reader, contentType string, out any, write bool, headers map[string]string) error {
+// invalidates the install's cached state. While WordPress's maintenance mode
+// answers instead of the plugin, the request is tried again. Bodies are
+// never logged.
+func (c *Client) do(ctx context.Context, install, method, path string, body []byte, contentType string, out any, write bool, headers map[string]string) error {
 	if c.tokens == nil {
 		return ErrNotInCI
 	}
@@ -236,12 +253,37 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 		c.invalidate(install)
 		defer c.invalidate(install)
 	}
+	deadline := time.Now().Add(maintenanceWait.timeout)
+	for {
+		err := c.attempt(ctx, install, method, path, body, contentType, out, write, headers)
+		if !errors.Is(err, errMaintenance) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s %s on %s: %w for longer than %s, while WordPress installs an update; try again once it's done", method, path, install, err, maintenanceWait.timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(maintenanceWait.interval):
+		}
+	}
+}
+
+// attempt makes one request. WordPress answers its maintenance page before it
+// loads any plugin, so a write token sent then isn't used up; the next
+// attempt gets a fresh one all the same.
+func (c *Client) attempt(ctx context.Context, install, method, path string, body []byte, contentType string, out any, write bool, headers map[string]string) error {
 	token, err := c.token(ctx, install, write)
 	if err != nil {
 		return err
 	}
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
 	endpoint := c.BaseURL(install) + "/?rest_route=" + url.QueryEscape(Namespace+path)
-	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
+	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 	if err != nil {
 		return err
 	}
@@ -261,6 +303,11 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 	raw, err := io.ReadAll(response.Body)
 	if err != nil {
 		return err
+	}
+	// WordPress's maintenance answer, as HTML or, to a request accepting JSON,
+	// as wp_die's JSON. The plugin's own 503s say something else.
+	if response.StatusCode == http.StatusServiceUnavailable && bytes.Contains(raw, []byte("Briefly unavailable for scheduled maintenance")) {
+		return errMaintenance
 	}
 	if response.StatusCode >= 300 {
 		apiErr := &APIError{Status: response.StatusCode, Install: install}
