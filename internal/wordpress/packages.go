@@ -74,10 +74,12 @@ func (c *Client) DeletePackage(ctx context.Context, install, kind, slug string) 
 	return c.do(ctx, install, http.MethodDelete, "/"+kind+"/"+url.PathEscape(slug), nil, "", nil, true, nil)
 }
 
-// GitHub's release download URLs, and its API; tests point them elsewhere.
+// GitHub's release download URLs, its API, and the origins the release
+// token is sent to; tests point them elsewhere.
 var (
 	githubRelease = regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/?#]+)$`)
 	githubAPI     = "https://api.github.com"
+	tokenOrigins  = map[string]bool{"https://github.com": true, "https://api.github.com": true}
 )
 
 // DownloadRelease downloads a release zip and checks it against its declared
@@ -88,7 +90,12 @@ func DownloadRelease(ctx context.Context, httpClient *http.Client, location, sha
 	data, err := download(ctx, httpClient, location, token, "")
 	if err != nil {
 		if match := githubRelease.FindStringSubmatch(location); match != nil {
-			data, err = downloadGitHubAsset(ctx, httpClient, match[1], match[2], match[3], match[4], token)
+			// The URL's path is escaped: a tag like plugin/v1.0.0 is plugin%2Fv1.0.0.
+			tag, tagErr := url.PathUnescape(match[3])
+			name, nameErr := url.PathUnescape(match[4])
+			if tagErr == nil && nameErr == nil {
+				data, err = downloadGitHubAsset(ctx, httpClient, match[1], match[2], tag, name, token)
+			}
 		}
 	}
 	if err != nil {
@@ -128,7 +135,9 @@ func download(ctx context.Context, httpClient *http.Client, location, token, acc
 	if err != nil {
 		return nil, err
 	}
-	if token != "" {
+	// The release token is GitHub's: only GitHub's own HTTPS origins get it.
+	// Go drops it on redirects to other hosts, such as GitHub's asset storage.
+	if token != "" && tokenOrigins[request.URL.Scheme+"://"+request.URL.Host] {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	if accept != "" {

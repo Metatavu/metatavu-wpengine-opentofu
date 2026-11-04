@@ -17,7 +17,7 @@ func sum(data []byte) string {
 	return hex.EncodeToString(s[:])
 }
 
-func TestDownloadReleaseChecksTheZipAndSendsTheToken(t *testing.T) {
+func TestDownloadReleaseChecksTheZipAndSendsTheTokenOnlyToGitHub(t *testing.T) {
 	zip := []byte("zip bytes")
 	var auth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,9 +26,16 @@ func TestDownloadReleaseChecksTheZipAndSendsTheToken(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Any other host, and plain HTTP, never gets the GitHub token.
 	data, err := DownloadRelease(context.Background(), server.Client(), server.URL+"/acme.zip", sum(zip), "release-token")
-	if err != nil || string(data) != "zip bytes" || auth != "Bearer release-token" {
+	if err != nil || string(data) != "zip bytes" || auth != "" {
 		t.Fatalf("data %q, err %v, auth %q", data, err, auth)
+	}
+
+	tokenOrigins[server.URL] = true
+	defer delete(tokenOrigins, server.URL)
+	if _, err := DownloadRelease(context.Background(), server.Client(), server.URL+"/acme.zip", sum(zip), "release-token"); err != nil || auth != "Bearer release-token" {
+		t.Fatalf("err %v, auth %q", err, auth)
 	}
 	if _, err := DownloadRelease(context.Background(), server.Client(), server.URL+"/acme.zip", sum([]byte("other")), ""); err == nil || !strings.Contains(err.Error(), "not the declared") {
 		t.Fatalf("err %v", err)
@@ -44,8 +51,8 @@ func TestDownloadReleaseFallsBackToGitHubsAPI(t *testing.T) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/acme/plugin/releases/download/"):
 			w.WriteHeader(http.StatusInternalServerError)
-		case r.URL.Path == "/repos/acme/plugin/releases/tags/v1.0.0":
-			fmt.Fprintf(w, `{"assets": [{"name": "plugin.zip", "url": "%s/assets/1"}]}`, server.URL)
+		case r.URL.EscapedPath() == "/repos/acme/plugin/releases/tags/plugin%2Fv1.0.0":
+			fmt.Fprintf(w, `{"assets": [{"name": "plugin 1.zip", "url": "%s/assets/1"}]}`, server.URL)
 		case r.URL.Path == "/assets/1" && r.Header.Get("Accept") == "application/octet-stream":
 			w.Write(zip)
 		default:
@@ -59,7 +66,8 @@ func TestDownloadReleaseFallsBackToGitHubsAPI(t *testing.T) {
 		githubAPI = "https://api.github.com"
 	}()
 
-	data, err := DownloadRelease(context.Background(), server.Client(), server.URL+"/acme/plugin/releases/download/v1.0.0/plugin.zip", sum(zip), "")
+	// A tag with a slash and an asset name with a space, escaped in the URL as GitHub does.
+	data, err := DownloadRelease(context.Background(), server.Client(), server.URL+"/acme/plugin/releases/download/plugin%2Fv1.0.0/plugin%201.zip", sum(zip), "")
 	if err != nil || string(data) != "release zip" {
 		t.Fatalf("data %q, err %v", data, err)
 	}
