@@ -112,6 +112,11 @@ type installCache struct {
 	state      *State
 	generation int
 
+	// sensitive is the whitelist's options and their sensitivity, from the
+	// last state read. Only bootstrap/ changes it, never a write, so it
+	// outlives the state.
+	sensitive map[string]bool
+
 	// writing lets one write at a time reach the install: WordPress keeps
 	// shared state such as active_plugins in single options, and concurrent
 	// activations would overwrite each other's.
@@ -157,7 +162,29 @@ func (c *Client) State(ctx context.Context, install string) (*State, error) {
 	if cache.generation == generation {
 		cache.state = &state
 	}
+	cache.sensitive = map[string]bool{}
+	for name, option := range state.Options {
+		cache.sensitive[name] = option.Sensitive
+	}
 	return &state, nil
+}
+
+// Sensitive tells which whitelisted options are sensitive: name to
+// sensitivity. It reads the state only when no read has happened yet.
+func (c *Client) Sensitive(ctx context.Context, install string) (map[string]bool, error) {
+	cache := c.cache(install)
+	cache.lock.Lock()
+	known := cache.sensitive
+	cache.lock.Unlock()
+	if known != nil {
+		return known, nil
+	}
+	if _, err := c.State(ctx, install); err != nil {
+		return nil, err
+	}
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+	return cache.sensitive, nil
 }
 
 func (c *Client) cache(install string) *installCache {

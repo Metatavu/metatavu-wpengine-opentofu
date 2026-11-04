@@ -106,6 +106,14 @@ func (s *Server) SetPackage(installName, kind, slug string, state Package) {
 	*s.installs[installName].packages[kind][slug] = state
 }
 
+// SetSensitive changes an option's sensitivity in the whitelist, as the
+// project's bootstrap/ would.
+func (s *Server) SetSensitive(installName, name string, sensitive bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.installs[installName].options[name] = sensitive
+}
+
 // Endpoint is an install's base URL, for the provider's wordpress_endpoints.
 func (s *Server) Endpoint(name string) string {
 	return s.URL + "/" + name

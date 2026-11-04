@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,7 +50,7 @@ func normalise(value any, top bool) any {
 		if top {
 			return number(v)
 		}
-		return json.Number(number(v))
+		return json.Number(jsonNumber(v))
 	case []any:
 		out := make([]any, len(v))
 		for i, item := range v {
@@ -85,22 +84,92 @@ func normalise(value any, top bool) any {
 	}
 }
 
-// number is a JSON number as PHP prints it: an integer as an integer, and a
-// float without a zero fraction (json_encode without
-// JSON_PRESERVE_ZERO_FRACTION), so 1, 1.0 and 1e0 are all 1. Floats in
-// exponent form beyond 1e15 may still differ from PHP's spelling.
-func number(n json.Number) string {
-	if i, err := n.Int64(); err == nil {
-		return strconv.FormatInt(i, 10)
+// Numbers become what PHP makes of them. A JSON integer stays an integer. A
+// float is printed by PHP's php_gcvt: as json_encode writes it inside an
+// array (shortest digits, exponent form beyond 17 digits or below 1e-4, no
+// ".0" on whole numbers), or as a string cast writes a top-level option
+// (14 significant digits, exponent form beyond 14 digits). Checked against
+// PHP 8.4's own output in normalise_test.go.
+
+// jsonNumber is a nested number as PHP's json_encode writes it.
+func jsonNumber(n json.Number) string {
+	if i, ok := integer(n); ok {
+		return i
 	}
 	f, err := n.Float64()
 	if err != nil {
 		return n.String()
 	}
-	if f == math.Trunc(f) && math.Abs(f) < 1e15 {
-		return strconv.FormatInt(int64(f), 10)
+	return phpGcvt(f, 17, true, 'e')
+}
+
+// number is a top-level number as PHP's string cast writes it.
+func number(n json.Number) string {
+	if i, ok := integer(n); ok {
+		return i
 	}
-	return strconv.FormatFloat(f, 'f', -1, 64)
+	f, err := n.Float64()
+	if err != nil {
+		return n.String()
+	}
+	return phpGcvt(f, 14, false, 'E')
+}
+
+// integer is a JSON integer literal, which PHP decodes as an int.
+func integer(n json.Number) (string, bool) {
+	if strings.ContainsAny(n.String(), ".eE") {
+		return "", false
+	}
+	i, err := n.Int64()
+	if err != nil {
+		return "", false
+	}
+	return strconv.FormatInt(i, 10), true
+}
+
+// phpGcvt formats a float as PHP's php_gcvt does: with ndigit significant
+// digits (or the shortest that round-trip), in exponent form when the
+// decimal point would be more than ndigit digits right, or more than three
+// zeros right, of the first digit.
+func phpGcvt(f float64, ndigit int, shortest bool, exponent byte) string {
+	if f == 0 {
+		return "0"
+	}
+	sign := ""
+	if f < 0 {
+		sign, f = "-", -f
+	}
+	precision := ndigit - 1
+	if shortest {
+		precision = -1
+	}
+	mantissa, exp, _ := strings.Cut(strconv.FormatFloat(f, 'e', precision, 64), "e")
+	digits := strings.TrimRight(strings.Replace(mantissa, ".", "", 1), "0")
+	if digits == "" {
+		digits = "0"
+	}
+	power, _ := strconv.Atoi(exp)
+	decpt := power + 1
+	switch {
+	case decpt < -3 || decpt > ndigit:
+		out := digits[:1] + "."
+		if len(digits) == 1 {
+			out += "0"
+		} else {
+			out += digits[1:]
+		}
+		expSign := "+"
+		if power < 0 {
+			expSign, power = "-", -power
+		}
+		return sign + out + string(exponent) + expSign + strconv.Itoa(power)
+	case decpt <= 0:
+		return sign + "0." + strings.Repeat("0", -decpt) + digits
+	case len(digits) <= decpt:
+		return sign + digits + strings.Repeat("0", decpt-len(digits))
+	default:
+		return sign + digits[:decpt] + "." + digits[decpt:]
+	}
 }
 
 // Canonical is a normalised value's canonical JSON (plugin D17): object keys
