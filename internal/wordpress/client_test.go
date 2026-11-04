@@ -41,6 +41,71 @@ func TestAResponseThatIsNotJSONIsExplained(t *testing.T) {
 	}
 }
 
+func TestValidJSONOfTheWrongShapeKeepsItsError(t *testing.T) {
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"wp_version": 6.9}`)
+	}))
+	defer plugin.Close()
+	_, err := New(map[string]string{"acmedev": plugin.URL}, &countingTokens{}, nil).State(context.Background(), "acmedev")
+	if err == nil || strings.Contains(err.Error(), "other than JSON") || !strings.Contains(err.Error(), "wp_version") {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// A queued write gets its token when its turn comes, not while it waits.
+func TestAQueuedWriteGetsItsTokenWhenItsTurnComes(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	release := make(chan struct{})
+	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		events = append(events, "request "+r.Header.Get("Authorization"))
+		first := len(events) == 2
+		mu.Unlock()
+		if first {
+			<-release
+		}
+		fmt.Fprint(w, `{"exists": true}`)
+	}))
+	defer plugin.Close()
+	tokens := tokenFunc(func(string) string {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, fmt.Sprintf("token %d", len(events)))
+		return fmt.Sprintf("t%d", len(events))
+	})
+	client := New(map[string]string{"acmedev": plugin.URL}, tokens, nil)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); _, _ = client.PutOption(context.Background(), "acmedev", "a", "1") }()
+	for {
+		mu.Lock()
+		n := len(events)
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); _, _ = client.PutOption(context.Background(), "acmedev", "b", "2") }()
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	queued := len(events)
+	mu.Unlock()
+	close(release)
+	wg.Wait()
+	if queued != 2 {
+		t.Fatalf("the queued write got a token while waiting: %v", events)
+	}
+}
+
+type tokenFunc func(audience string) string
+
+func (f tokenFunc) Token(_ context.Context, audience string) (string, error) {
+	return f(audience), nil
+}
+
 func TestOutsideActionsThereAreNoTokens(t *testing.T) {
 	t.Setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "")
 	if ActionsTokens(nil) != nil {

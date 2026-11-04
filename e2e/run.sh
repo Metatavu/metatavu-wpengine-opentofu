@@ -24,7 +24,13 @@ build=$root/e2e/build
 failures=0
 
 check() { if [[ $2 == "$3" ]]; then echo "ok   $1"; else echo "FAIL $1: got '$2', expected '$3'" >&2; failures=$((failures + 1)); fi; }
-wp() { (cd e2e && npx -y @wordpress/env@10 run cli wp "$@" 2>/dev/null | grep -v -E '^(ℹ|✔)' | tr -d '\r'); }
+# WP-CLI in the site's container: its exit status, and its output without wp-env's own lines.
+wp() {
+	local out status=0
+	out=$(cd e2e && npx -y @wordpress/env@10 run cli wp "$@" 2>/dev/null) || status=$?
+	printf '%s\n' "$out" | grep -v -E '^(ℹ|✔)' | tr -d '\r' | sed '/^$/d' || true
+	return "$status"
+}
 
 # A running wp-env keeps its mounts of the old build, so it starts again after the build is replaced.
 (cd e2e && npx -y @wordpress/env@10 stop >/dev/null 2>&1) || true
@@ -93,7 +99,17 @@ expect_no_changes() {
 	check "$1" "$code" 0
 	[[ $code == 0 ]] || grep -E '^\s+[~+-]|will be|must be' "$build/plan.txt" >&2 || true
 }
-plugin_status() { wp plugin list --name="$1" --field=status; }
+# "active", "inactive" or "deleted" from a successful list; anything else when WP-CLI fails.
+plugin_status() {
+	local list
+	list=$(wp plugin list --fields=name,status --format=csv) || { echo "wp-cli failed"; return; }
+	awk -F, -v slug="$1" '$1 == slug { print $2; found = 1 } END { if (!found) print "deleted" }' <<<"$list"
+}
+theme_status() {
+	local list
+	list=$(wp theme list --fields=name,status --format=csv) || { echo "wp-cli failed"; return; }
+	awk -F, -v slug="$1" '$1 == slug { print $2; found = 1 } END { if (!found) print "deleted" }' <<<"$list"
+}
 
 echo "== apply"
 tofu_run apply 1.0.0 -auto-approve >/dev/null
@@ -130,9 +146,9 @@ check "the change in wp-admin is logged" "$([[ ${changes:-0} -gt 0 ]] && echo ye
 echo "== destroy"
 tofu_run apply 1.1.0 -auto-approve -var active_theme=twentytwentyfive >/dev/null
 tofu_run destroy 1.1.0 -auto-approve -var active_theme=twentytwentyfive >/dev/null
-check "the wordpress.org plugin is deleted" "$(plugin_status classic-editor)" ""
-check "the release plugin is deleted" "$(plugin_status acme-release)" ""
-check "the theme is deleted" "$(wp theme list --name=twentytwentythree --field=status)" ""
+check "the wordpress.org plugin is deleted" "$(plugin_status classic-editor)" deleted
+check "the release plugin is deleted" "$(plugin_status acme-release)" deleted
+check "the theme is deleted" "$(theme_status twentytwentythree)" deleted
 check "the option is left in WordPress" "$(wp option get blogdescription)" "Managed end to end"
 
 if ((failures > 0)); then

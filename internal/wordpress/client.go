@@ -200,16 +200,18 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 	if c.tokens == nil {
 		return ErrNotInCI
 	}
-	token, err := c.token(ctx, install, write)
-	if err != nil {
-		return err
-	}
+	// A write waits for its turn before it gets its token, so a long queue of
+	// slow installs can't outlast the plugin's five-minute window.
 	if write {
 		cache := c.cache(install)
 		cache.writing.Lock()
 		defer cache.writing.Unlock()
 		c.invalidate(install)
 		defer c.invalidate(install)
+	}
+	token, err := c.token(ctx, install, write)
+	if err != nil {
+		return err
 	}
 	endpoint := c.BaseURL(install) + "/?rest_route=" + url.QueryEscape(Namespace+path)
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
@@ -242,6 +244,9 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
+			if json.Valid(raw) {
+				return fmt.Errorf("the IaC plugin on %s answered %s %s with an unexpected response: %w", install, method, path, err)
+			}
 			return fmt.Errorf("the IaC plugin on %s answered %s %s with something other than JSON, starting %q: "+
 				"something on the site printed output before the response, such as a PHP notice or a database error shown with WP_DEBUG; see the site's error log",
 				install, method, path, preview(raw))
