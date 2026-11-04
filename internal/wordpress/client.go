@@ -146,7 +146,7 @@ func (c *Client) State(ctx context.Context, install string) (*State, error) {
 	}
 	generation := cache.generation
 	var state State
-	if err := c.do(ctx, install, http.MethodGet, "/state", nil, "", &state, false); err != nil {
+	if err := c.do(ctx, install, http.MethodGet, "/state", nil, "", &state, false, nil); err != nil {
 		return nil, err
 	}
 	if cache.generation == generation {
@@ -179,19 +179,19 @@ func (c *Client) invalidate(install string) {
 func (c *Client) PutOption(ctx context.Context, install, name string, value any) (*OptionState, error) {
 	var option OptionState
 	body, _ := json.Marshal(map[string]any{"value": value})
-	return &option, c.do(ctx, install, http.MethodPut, "/options/"+url.PathEscape(name), bytes.NewReader(body), "application/json", &option, true)
+	return &option, c.do(ctx, install, http.MethodPut, "/options/"+url.PathEscape(name), bytes.NewReader(body), "application/json", &option, true, nil)
 }
 
 // PutActiveTheme activates a whitelisted, installed theme.
 func (c *Client) PutActiveTheme(ctx context.Context, install, slug string) error {
 	body, _ := json.Marshal(map[string]string{"slug": slug})
-	return c.do(ctx, install, http.MethodPut, "/active-theme", bytes.NewReader(body), "application/json", nil, true)
+	return c.do(ctx, install, http.MethodPut, "/active-theme", bytes.NewReader(body), "application/json", nil, true, nil)
 }
 
 // do calls the plugin through ?rest_route= (provider D18), which works with
 // any permalink setting. A write gets a fresh token (provider D17) and
 // invalidates the install's cached state. Bodies are never logged.
-func (c *Client) do(ctx context.Context, install, method, path string, body io.Reader, contentType string, out any, write bool) error {
+func (c *Client) do(ctx context.Context, install, method, path string, body io.Reader, contentType string, out any, write bool, headers map[string]string) error {
 	if c.tokens == nil {
 		return ErrNotInCI
 	}
@@ -212,6 +212,9 @@ func (c *Client) do(ctx context.Context, install, method, path string, body io.R
 	request.Header.Set("Accept", "application/json")
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
 	}
 	response, err := c.http.Do(request)
 	if err != nil {

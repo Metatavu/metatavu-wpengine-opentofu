@@ -139,6 +139,8 @@ func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 		NewSSHKeyResource,
 		NewWordPressOptionResource,
 		NewWordPressActiveThemeResource,
+		NewWordPressPluginResource,
+		NewWordPressThemeResource,
 	}
 }
 
