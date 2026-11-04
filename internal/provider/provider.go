@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/client"
+	"github.com/Metatavu/metatavu-wpengine-opentofu/internal/wordpress"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -29,6 +30,10 @@ type providerModel struct {
 	APIURL      types.String `tfsdk:"api_url"`
 	APIUsername types.String `tfsdk:"api_username"`
 	APIPassword types.String `tfsdk:"api_password"`
+
+	WordPressEndpoints    types.Map    `tfsdk:"wordpress_endpoints"`
+	WordPressTokenCommand types.String `tfsdk:"wordpress_token_command"`
+	ReleaseToken          types.String `tfsdk:"release_token"`
 }
 
 func (p *Provider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -40,6 +45,8 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Declares what is Metatavu's concern about a WordPress project on WP Engine. " +
 			"The `wpengine_*` platform resources use the WP Engine API, and need its credentials; nothing else does. " +
+			"The `wpengine_wordpress_*` resources use the metatavu-wordpress-iac mu-plugin on each install, with GitHub Actions OIDC tokens: " +
+			"they work only in a workflow with `permissions: id-token: write`. " +
 			"Each setting can come from its environment variable instead.",
 		Attributes: map[string]schema.Attribute{
 			"api_url": schema.StringAttribute{
@@ -55,6 +62,20 @@ func (p *Provider) Schema(_ context.Context, _ provider.SchemaRequest, resp *pro
 				Sensitive:           true,
 				MarkdownDescription: "The API user's password (`WPENGINE_API_PASSWORD`).",
 			},
+			"wordpress_endpoints": schema.MapAttribute{
+				Optional:            true,
+				ElementType:         types.StringType,
+				MarkdownDescription: "Install name to base URL, for tests, overriding `https://<install>.wpengine.com`.",
+			},
+			"wordpress_token_command": schema.StringAttribute{
+				Optional:            true,
+				MarkdownDescription: "A command that prints a token for the install in `IAC_AUDIENCE`, run for each token, for tests (`WPENGINE_WORDPRESS_TOKEN_COMMAND`). Without it, tokens come from GitHub Actions.",
+			},
+			"release_token": schema.StringAttribute{
+				Optional:            true,
+				Sensitive:           true,
+				MarkdownDescription: "A token for downloading release zips from private GitHub releases (`WPENGINE_RELEASE_TOKEN`).",
+			},
 		},
 	}
 }
@@ -65,7 +86,8 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if config.APIURL.IsUnknown() || config.APIUsername.IsUnknown() || config.APIPassword.IsUnknown() {
+	if config.APIURL.IsUnknown() || config.APIUsername.IsUnknown() || config.APIPassword.IsUnknown() ||
+		config.WordPressEndpoints.IsUnknown() || config.WordPressTokenCommand.IsUnknown() || config.ReleaseToken.IsUnknown() {
 		resp.Diagnostics.AddError("Unknown provider configuration", "The wpengine provider's settings must be known when planning.")
 		return
 	}
@@ -88,6 +110,21 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 		}
 		data.platform = c
 	}
+
+	endpoints := map[string]string{}
+	resp.Diagnostics.Append(config.WordPressEndpoints.ElementsAs(ctx, &endpoints, false)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	var tokens wordpress.TokenSource
+	if command := first(config.WordPressTokenCommand.ValueString(), os.Getenv("WPENGINE_WORDPRESS_TOKEN_COMMAND")); command != "" {
+		tokens = wordpress.CommandTokens(command)
+	} else if actions := wordpress.ActionsTokens(nil); actions != nil {
+		tokens = actions
+	}
+	data.wordpress = wordpress.New(endpoints, tokens, nil)
+	data.releaseToken = first(config.ReleaseToken.ValueString(), os.Getenv("WPENGINE_RELEASE_TOKEN"))
+
 	resp.ResourceData = data
 	resp.DataSourceData = data
 }
@@ -100,6 +137,10 @@ func (p *Provider) Resources(_ context.Context) []func() resource.Resource {
 		NewCacheExclusionsResource,
 		NewAccountUserResource,
 		NewSSHKeyResource,
+		NewWordPressOptionResource,
+		NewWordPressActiveThemeResource,
+		NewWordPressPluginResource,
+		NewWordPressThemeResource,
 	}
 }
 

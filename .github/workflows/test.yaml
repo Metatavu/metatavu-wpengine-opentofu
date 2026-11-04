@@ -17,10 +17,26 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # The resource tests run OpenTofu against an in-memory stand-in for the WP Engine API.
+      # The resource tests run OpenTofu against in-memory stand-ins for the WP Engine API and the IaC mu-plugin.
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_wrapper: false
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
       - run: go test ./...
+
+  # The provider, run by OpenTofu, against WordPress with the released IaC mu-plugin.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_wrapper: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: e2e/run.sh
