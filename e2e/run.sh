@@ -17,8 +17,8 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
-plugin_version=0.3.0
-plugin_sha256=bb85202feb87dfa83f8cf72aa7495ee44ab3beb39cf62fd751b6bc7a133fc899
+plugin_version=0.4.0
+plugin_sha256=0c17106353afdf8d13507ed89d234e87d7cef3cc3da353b5f2fbfd131f111adb
 port=${WP_ENV_PORT:-8888}
 releases_port=${E2E_RELEASES_PORT:-8897}
 site=http://localhost:$port
@@ -120,6 +120,8 @@ wp plugin deactivate classic-editor acme-release >/dev/null 2>&1 || true
 wp plugin delete classic-editor acme-release >/dev/null 2>&1 || true
 wp theme delete twentytwentythree >/dev/null 2>&1 || true
 wp option delete metatavu_iac_release_plugin_acme-release >/dev/null 2>&1 || true
+wp plugin auto-updates disable classic-editor >/dev/null 2>&1 || true
+wp theme auto-updates disable twentytwentythree >/dev/null 2>&1 || true
 wp plugin install classic-editor >/dev/null
 wp theme install twentytwentythree >/dev/null
 # The CLI container sees the site's files, not this machine's, so the zip goes through wp-content.
@@ -135,17 +137,21 @@ check "an option" "$(wp option get blogdescription)" "Managed end to end"
 check "a number is stored as WordPress stores it" "$(wp option get posts_per_page)" 12
 check "the secret's URL keeps its & and its {} is []" "$(wp option get acme_api --format=json)" '{"flags":[],"secret":"s3cr3t&<x>","url":"https:\/\/api.example.com\/?a=1&b=2"}'
 check "a wordpress.org plugin, active" "$(plugin_status classic-editor)" active
+check "a wordpress.org plugin, updated automatically by WordPress" "$(wp plugin auto-updates status classic-editor --field=status)" enabled
+check "a wordpress.org theme, updated automatically by WordPress" "$(wp theme auto-updates status twentytwentythree --field=status)" enabled
 check "a release plugin, updated by WordPress within the apply, and active" "$(wp plugin get acme-release --field=version) $(plugin_status acme-release)" "1.0.0 active"
 check "the active theme" "$(wp option get stylesheet)" twentytwentythree
 
 echo "== drift made in wp-admin is shown and put back"
 wp option update blogdescription "Changed by hand" >/dev/null
 wp plugin deactivate classic-editor >/dev/null
+wp plugin auto-updates disable classic-editor >/dev/null
 wp option update acme_api '{"secret":"leaked"}' --format=json >/dev/null
 check "the plan shows the drift" "$(plan_exit 1.0.0)" 2
 tofu_run apply 1.0.0 -auto-approve >/dev/null
 check "the option is put back" "$(wp option get blogdescription)" "Managed end to end"
 check "the plugin is active again" "$(plugin_status classic-editor)" active
+check "its automatic updates are on again" "$(wp plugin auto-updates status classic-editor --field=status)" enabled
 check "the secret is put back" "$(wp option get acme_api --format=json | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["secret"])')" "s3cr3t&<x>"
 expect_no_changes "then there are no changes" 1.0.0
 

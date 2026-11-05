@@ -23,20 +23,24 @@ const (
 
 // PackageState is a plugin's or theme's state after a write.
 type PackageState struct {
-	Installed bool     `json:"installed"`
-	Version   *string  `json:"version"`
-	Active    bool     `json:"active"`
-	Pending   *Pending `json:"pending"`
+	Installed  bool     `json:"installed"`
+	Version    *string  `json:"version"`
+	Active     bool     `json:"active"`
+	AutoUpdate bool     `json:"auto_update"`
+	Pending    *Pending `json:"pending"`
 }
 
 // AdoptFromWordPressOrg takes over a whitelisted package from wordpress.org
-// that the project's bootstrap/ has installed (WP Engine keeps it up to
-// date), and sets whether a plugin is active. The plugin forgets a release
-// declared for it earlier.
-func (c *Client) AdoptFromWordPressOrg(ctx context.Context, install, kind, slug string, active bool) (*PackageState, error) {
+// that the project's bootstrap/ has installed, sets whether a plugin is active, and sets WordPress's automatic
+// updates for it unless autoUpdate is nil (plugin D24). The plugin forgets a
+// release declared for it earlier.
+func (c *Client) AdoptFromWordPressOrg(ctx context.Context, install, kind, slug string, active bool, autoUpdate *bool) (*PackageState, error) {
 	body := map[string]any{"source": "wordpress.org"}
 	if kind == Plugins {
 		body["active"] = active
+	}
+	if autoUpdate != nil {
+		body["auto_update"] = *autoUpdate
 	}
 	encoded, _ := json.Marshal(body)
 	var state PackageState

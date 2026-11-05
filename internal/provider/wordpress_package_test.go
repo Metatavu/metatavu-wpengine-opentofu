@@ -90,6 +90,8 @@ resource "wpengine_wordpress_plugin" "acme" {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.classic_editor", "installed_version", "1.7.0"),
 					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.acme", "installed_version", "1.0.0"),
+					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.classic_editor", "auto_update", "true"),
+					resource.TestCheckNoResourceAttr("wpengine_wordpress_plugin.acme", "auto_update"),
 					func(*terraform.State) error {
 						if p := server.Package("acmedev", "plugins", "classic-editor"); !p.Active {
 							return fmt.Errorf("classic-editor %+v", p)
@@ -185,6 +187,91 @@ import {
 				}
 			}
 			return nil
+		},
+	})
+}
+
+func TestWordPressOrgPackagesAreKeptCurrentByWordPress(t *testing.T) {
+	server := newWordPress(t)
+	server.Whitelist("acmedev", "plugins", "classic-editor")
+	server.Install("acmedev", "plugins", "classic-editor", "1.7.0")
+	plugin := func(autoUpdate string) string {
+		return wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_plugin" "classic_editor" {
+  install = "acmedev"
+  slug    = "classic-editor"
+  source  = "wordpress.org"
+` + autoUpdate + `
+}
+`
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: factories,
+		Steps: []resource.TestStep{
+			{
+				// Automatic updates are on unless switched off (provider D23).
+				Config: plugin(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.classic_editor", "auto_update", "true"),
+					func(*terraform.State) error {
+						if p := server.Package("acmedev", "plugins", "classic-editor"); !p.AutoUpdate {
+							return fmt.Errorf("classic-editor %+v", p)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// WordPress updated it: nothing is planned, and nothing is downgraded.
+				PreConfig: func() {
+					server.SetPackage("acmedev", "plugins", "classic-editor", fakewp.Package{Installed: true, Version: "1.8.0", Active: true, AutoUpdate: true})
+				},
+				Config: plugin(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("wpengine_wordpress_plugin.classic_editor", "installed_version", "1.8.0"),
+					func(*terraform.State) error {
+						if p := server.Package("acmedev", "plugins", "classic-editor"); p.Version != "1.8.0" {
+							return fmt.Errorf("classic-editor %+v", p)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// Switched off in wp-admin: the plan shows it, and the apply puts it back.
+				PreConfig: func() {
+					server.SetPackage("acmedev", "plugins", "classic-editor", fakewp.Package{Installed: true, Version: "1.8.0", Active: true})
+				},
+				Config: plugin(""),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction("wpengine_wordpress_plugin.classic_editor", plancheck.ResourceActionUpdate)},
+				},
+				Check: func(*terraform.State) error {
+					if p := server.Package("acmedev", "plugins", "classic-editor"); !p.AutoUpdate || p.Version != "1.8.0" {
+						return fmt.Errorf("classic-editor %+v", p)
+					}
+					return nil
+				},
+			},
+			{
+				Config: plugin("  auto_update = false"),
+				Check: func(*terraform.State) error {
+					if p := server.Package("acmedev", "plugins", "classic-editor"); p.AutoUpdate {
+						return fmt.Errorf("classic-editor %+v", p)
+					}
+					return nil
+				},
+			},
+			{
+				Config: plugin("  auto_update = false"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
 		},
 	})
 }
@@ -298,7 +385,10 @@ resource "wpengine_wordpress_active_theme" "acmedev" {
 		Steps: []resource.TestStep{
 			{
 				Config: theme("twentytwentythree"),
-				Check:  resource.TestCheckResourceAttr("wpengine_wordpress_theme.tt3", "installed_version", "1.7"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("wpengine_wordpress_theme.tt3", "installed_version", "1.7"),
+					resource.TestCheckResourceAttr("wpengine_wordpress_theme.tt3", "auto_update", "true"),
+				),
 			},
 			{Config: theme("twentytwentyfive")},
 			{
@@ -347,6 +437,20 @@ resource "wpengine_wordpress_plugin" "org" {
 }
 `,
 				ExpectError: regexp.MustCompile(`Only a release has version`),
+			},
+			{
+				Config: wordpressProvider(server, "acmedev") + `
+resource "wpengine_wordpress_plugin" "release" {
+  install     = "acmedev"
+  slug        = "classic-editor"
+  source      = "release"
+  url         = "https://example.com/classic-editor.zip"
+  version     = "1.0"
+  sha256      = "0000000000000000000000000000000000000000000000000000000000000000"
+  auto_update = true
+}
+`,
+				ExpectError: regexp.MustCompile(`Only a wordpress.org package has auto_update`),
 			},
 			{
 				Config: wordpressProvider(server, "acmedev") + `

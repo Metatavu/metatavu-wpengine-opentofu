@@ -52,6 +52,7 @@ type wordpressPackageModel struct {
 	Version          types.String `tfsdk:"version"`
 	SHA256           types.String `tfsdk:"sha256"`
 	Active           types.Bool   `tfsdk:"active"`
+	AutoUpdate       types.Bool   `tfsdk:"auto_update"`
 	InstalledVersion types.String `tfsdk:"installed_version"`
 }
 
@@ -112,7 +113,13 @@ func (r *wordpressPackageResource) Schema(_ context.Context, _ resource.SchemaRe
 		},
 		"installed_version": schema.StringAttribute{
 			Computed:            true,
-			MarkdownDescription: "The version installed, which WP Engine keeps up to date for wordpress.org packages.",
+			MarkdownDescription: "The version installed. A wordpress.org package's is only read: WordPress's automatic updates move it, and it's never planned as a change, so an apply never downgrades it (provider D23).",
+		},
+		"auto_update": schema.BoolAttribute{
+			Optional:            true,
+			Computed:            true,
+			MarkdownDescription: "For a `wordpress.org` " + r.noun() + ": whether WordPress's own automatic updates keep it current, default `true` (provider D23). A change made in wp-admin shows as drift. A release has none: its `version` is declared.",
+			PlanModifiers:       []planmodifier.Bool{autoUpdateDefault{}},
 		},
 	}
 	description := "A whitelisted " + r.noun() + " on an install, through the IaC mu-plugin. The project's bootstrap/ installs and removes it over SSH; this resource takes it over (provider D20). Destroying it "
@@ -143,16 +150,21 @@ func (r *wordpressPackageResource) ValidateConfig(ctx context.Context, req resou
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("url"), &config.URL)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("version"), &config.Version)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("sha256"), &config.SHA256)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("auto_update"), &config.AutoUpdate)...)
 	if resp.Diagnostics.HasError() || config.Source.IsUnknown() {
 		return
 	}
 	release := config.Source.ValueString() == sourceRelease
+	if release && !config.AutoUpdate.IsNull() {
+		resp.Diagnostics.AddAttributeError(path.Root("auto_update"), "Only a wordpress.org package has auto_update",
+			"A release's version is declared: only that version is installed, and WordPress doesn't update it from anywhere else.")
+	}
 	for name, value := range map[string]types.String{"url": config.URL, "version": config.Version, "sha256": config.SHA256} {
 		switch {
 		case release && value.IsNull():
 			resp.Diagnostics.AddAttributeError(path.Root(name), "A release needs "+name, "Give url, version and sha256 for a release.")
 		case !release && !value.IsNull():
-			resp.Diagnostics.AddAttributeError(path.Root(name), "Only a release has "+name, "A wordpress.org package is installed by slug; WP Engine keeps it up to date.")
+			resp.Diagnostics.AddAttributeError(path.Root(name), "Only a release has "+name, "A wordpress.org package has no declared version: WordPress's automatic updates keep it current (auto_update).")
 		}
 	}
 }
@@ -210,7 +222,8 @@ func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressP
 		err   error
 	)
 	if plan.Source.ValueString() == sourceWordPressOrg {
-		state, err = r.client.AdoptFromWordPressOrg(ctx, install, r.kind, slug, active)
+		autoUpdate := plan.AutoUpdate.ValueBool()
+		state, err = r.client.AdoptFromWordPressOrg(ctx, install, r.kind, slug, active, &autoUpdate)
 	} else {
 		zip, downloadErr := wordpress.DownloadRelease(ctx, r.client.HTTP(), plan.URL.ValueString(), plan.SHA256.ValueString(), r.releaseToken)
 		if downloadErr != nil {
@@ -232,6 +245,10 @@ func (r *wordpressPackageResource) install(ctx context.Context, plan *wordpressP
 	}
 	plan.ID = types.StringValue(install + "/" + slug)
 	plan.InstalledVersion = stringValue(version)
+	plan.AutoUpdate = types.BoolNull()
+	if plan.Source.ValueString() == sourceWordPressOrg {
+		plan.AutoUpdate = types.BoolValue(state.AutoUpdate)
+	}
 	if r.kind == wordpress.Themes {
 		live, err := r.client.State(ctx, install)
 		if err != nil {
@@ -304,18 +321,18 @@ func (r *wordpressPackageResource) Read(ctx context.Context, req resource.ReadRe
 		return
 	}
 	var (
-		installed, active bool
-		version           *string
-		whitelisted       bool
+		installed, active, autoUpdate bool
+		version                       *string
+		whitelisted                   bool
 	)
 	if r.kind == wordpress.Plugins {
 		var plugin wordpress.PluginState
 		plugin, whitelisted = live.Plugins[slug]
-		installed, version, active = plugin.Installed, plugin.Version, plugin.Active
+		installed, version, active, autoUpdate = plugin.Installed, plugin.Version, plugin.Active, plugin.AutoUpdate
 	} else {
 		var theme wordpress.ThemeState
 		theme, whitelisted = live.Themes[slug]
-		installed, version = theme.Installed, theme.Version
+		installed, version, autoUpdate = theme.Installed, theme.Version, theme.AutoUpdate
 	}
 	if !whitelisted {
 		resp.Diagnostics.AddError(r.noun()+" "+slug+" isn't managed on "+install,
@@ -328,9 +345,13 @@ func (r *wordpressPackageResource) Read(ctx context.Context, req resource.ReadRe
 	}
 	state.ID = types.StringValue(install + "/" + slug)
 	state.InstalledVersion = stringValue(version)
-	// A release shows a version changed in wp-admin as drift.
+	// A release shows a version changed in wp-admin as drift. A wordpress.org
+	// package's version isn't compared (provider D23); its automatic updates are.
 	if !state.Version.IsNull() {
 		state.Version = stringValue(version)
+	}
+	if state.Source.ValueString() != sourceRelease {
+		state.AutoUpdate = types.BoolValue(autoUpdate)
 	}
 	if r.kind == wordpress.Plugins {
 		state.Active = types.BoolValue(active)
@@ -349,7 +370,7 @@ func (r *wordpressPackageResource) Delete(ctx context.Context, req resource.Dele
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	_, err := r.client.AdoptFromWordPressOrg(ctx, state.Install.ValueString(), r.kind, state.Slug.ValueString(), false)
+	_, err := r.client.AdoptFromWordPressOrg(ctx, state.Install.ValueString(), r.kind, state.Slug.ValueString(), false, nil)
 	if err != nil && !wordpress.IsCode(err, "metatavu_iac_not_installed") {
 		addWordPressError(&resp.Diagnostics, "Releasing "+r.noun()+" "+state.Slug.ValueString()+" failed", err)
 	}
@@ -364,4 +385,33 @@ func (r *wordpressPackageResource) ImportState(ctx context.Context, req resource
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("install"), install)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("slug"), slug)...)
+}
+
+// autoUpdateDefault plans auto_update as true for a wordpress.org package when
+// it isn't set, and as null for a release (provider D23). A static default
+// can't depend on the source.
+type autoUpdateDefault struct{}
+
+func (autoUpdateDefault) Description(context.Context) string {
+	return "true for a wordpress.org package unless set; none for a release"
+}
+
+func (m autoUpdateDefault) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (autoUpdateDefault) PlanModifyBool(ctx context.Context, req planmodifier.BoolRequest, resp *planmodifier.BoolResponse) {
+	if !req.ConfigValue.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	var source types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("source"), &source)...)
+	switch {
+	case source.IsUnknown():
+		resp.PlanValue = types.BoolUnknown()
+	case source.ValueString() == sourceWordPressOrg:
+		resp.PlanValue = types.BoolValue(true)
+	default:
+		resp.PlanValue = types.BoolNull()
+	}
 }
