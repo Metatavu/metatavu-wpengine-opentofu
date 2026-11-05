@@ -28,17 +28,19 @@ type OptionState struct {
 
 // PluginState is a whitelisted plugin.
 type PluginState struct {
-	Installed bool     `json:"installed"`
-	Version   *string  `json:"version"`
-	Active    bool     `json:"active"`
-	Pending   *Pending `json:"pending"`
+	Installed  bool     `json:"installed"`
+	Version    *string  `json:"version"`
+	Active     bool     `json:"active"`
+	AutoUpdate bool     `json:"auto_update"`
+	Pending    *Pending `json:"pending"`
 }
 
 // ThemeState is a whitelisted theme.
 type ThemeState struct {
-	Installed bool     `json:"installed"`
-	Version   *string  `json:"version"`
-	Pending   *Pending `json:"pending"`
+	Installed  bool     `json:"installed"`
+	Version    *string  `json:"version"`
+	AutoUpdate bool     `json:"auto_update"`
+	Pending    *Pending `json:"pending"`
 }
 
 // Pending is a declared release that WordPress's automatic updater hasn't

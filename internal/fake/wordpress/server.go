@@ -63,6 +63,7 @@ type Package struct {
 	Installed    bool
 	Version      string
 	Active       bool
+	AutoUpdate   bool
 	Pending      string
 	PendingError string
 }
@@ -276,6 +277,10 @@ func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install,
 			writeError(w, http.StatusUnprocessableEntity, "metatavu_iac_checksum_mismatch", "The zip's SHA-256 isn't the declared one.")
 			return
 		}
+		if r.FormValue("auto_update") != "" {
+			writeError(w, http.StatusBadRequest, "metatavu_iac_invalid", "auto_update is for a wordpress.org package only: a release's version is declared.")
+			return
+		}
 		if r.FormValue("active") != "" {
 			active, _ = strconv.ParseBool(r.FormValue("active"))
 		}
@@ -287,8 +292,9 @@ func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install,
 		s.Uploads[name]++
 	} else {
 		var body struct {
-			Source string `json:"source"`
-			Active *bool  `json:"active"`
+			Source     string `json:"source"`
+			Active     *bool  `json:"active"`
+			AutoUpdate *bool  `json:"auto_update"`
 		}
 		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Source != "wordpress.org" {
 			writeError(w, http.StatusBadRequest, "metatavu_iac_invalid", "source is wordpress.org or release.")
@@ -296,6 +302,9 @@ func (s *Server) putPackage(w http.ResponseWriter, r *http.Request, in *install,
 		}
 		if body.Active != nil {
 			active = *body.Active
+		}
+		if body.AutoUpdate != nil {
+			pkg.AutoUpdate = *body.AutoUpdate
 		}
 		// A release declared earlier is forgotten.
 		pkg.Pending, pkg.PendingError = "", ""
@@ -333,7 +342,7 @@ func packageState(kind string, pkg *Package) map[string]any {
 	if pkg.Installed {
 		version = pkg.Version
 	}
-	state := map[string]any{"installed": pkg.Installed, "version": version}
+	state := map[string]any{"installed": pkg.Installed, "version": version, "auto_update": pkg.Installed && pkg.AutoUpdate}
 	if kind == "plugins" {
 		state["active"] = pkg.Active
 	}
